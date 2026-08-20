@@ -1,0 +1,6 @@
+# Phase 1 (eval harness) uses only the Python standard library.
+# Uncomment/add as later phases need them:
+
+# openai>=1.0.0          # Phase 2: main LLM + external verifier calls
+# tiktoken>=0.7.0         # Phase 2: token counting before API calls
+# pytest>=7.0.0           # recommended for running tests/
