@@ -6,15 +6,50 @@ OpenAI token pricing and cost-estimation helpers.
 
 IMPORTANT: OpenAI revises pricing periodically. The table below reflects
 rates commonly reported as of mid-2026. Before running real experiments,
-verify against https://openai.com/api/pricing and update PRICING_TABLE.
-Keeping this in one place means a price change is a one-line edit, not a
-hunt through the codebase.
+verify against https://openai.com/api/pricing and update PRICING_TABLE
+and PRICING_VERIFIED_DATE. Keeping this in one place means a price change
+is a one-line edit, not a hunt through the codebase.
 
 All rates are USD per 1,000,000 tokens.
 """
 
 from __future__ import annotations
+
+import datetime
+import warnings
 from typing import Dict, NamedTuple
+
+# ------------------------------------------------------------------
+# Staleness guard
+# ------------------------------------------------------------------
+# Update this date every time you verify PRICING_TABLE against
+# https://openai.com/api/pricing.  estimate_cost_usd() will emit a
+# warning if the table is more than STALENESS_THRESHOLD_DAYS old,
+# so you never silently publish CPST numbers based on stale rates.
+# ------------------------------------------------------------------
+PRICING_VERIFIED_DATE: datetime.date = datetime.date(2026, 8, 20)
+STALENESS_THRESHOLD_DAYS: int = 30
+
+_staleness_warned: bool = False
+
+
+def _check_pricing_staleness() -> None:
+    """Warn once per process if the pricing table hasn't been verified
+    within STALENESS_THRESHOLD_DAYS."""
+    global _staleness_warned
+    if _staleness_warned:
+        return
+    age_days = (datetime.date.today() - PRICING_VERIFIED_DATE).days
+    if age_days > STALENESS_THRESHOLD_DAYS:
+        _staleness_warned = True
+        warnings.warn(
+            f"PRICING_TABLE was last verified {age_days} days ago "
+            f"({PRICING_VERIFIED_DATE.isoformat()}). CPST numbers may be "
+            f"inaccurate. Verify rates at https://openai.com/api/pricing "
+            f"and update PRICING_VERIFIED_DATE in costs.py.",
+            UserWarning,
+            stacklevel=3,
+        )
 
 
 class ModelPricing(NamedTuple):
@@ -53,6 +88,8 @@ def estimate_cost_usd(
     at the discounted cached rate. Must be <= prompt_tokens; the remainder
     of prompt_tokens is billed at the standard input rate.
     """
+    _check_pricing_staleness()
+
     if model_name not in PRICING_TABLE:
         raise KeyError(
             f"No pricing entry for '{model_name}'. "
