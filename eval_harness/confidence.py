@@ -15,7 +15,7 @@ router inverts it: low confidence -> call a tool.
 Estimators (built in order):
     (a) token entropy      -- THIS FILE, below
     (b) self-consistency   -- THIS FILE, below
-    (c) external verifier  -- next
+    (c) external verifier  -- THIS FILE, below
     (d) hybrid combiner    -- next
 
 --- (a) Token-entropy estimator ---------------------------------------
@@ -50,6 +50,32 @@ asymmetry is the point of the routing experiment: entropy is cheap
 enough to run on every task, self-consistency is what you escalate to.
 
 Also pure -- takes already-collected samples, makes no network calls.
+
+--- (c) External-verifier estimator ------------------------------------
+
+Ask a cheap second model whether the main model's answer is right, and
+turn its judgement into a confidence. One extra call to a small model
+(gpt-4o-mini, o4-mini) against one call to the big one, so it sits
+between (a) and (b) on cost: dearer than reading logprobs you already
+have, far cheaper than k full resamples of an expensive model.
+
+The signal is different in kind from both. (a) and (b) ask the model
+about itself and inherit its blind spots -- a model confidently wrong
+about a fact is fluent AND reproducible, so entropy is low and agreement
+is high, and both estimators say "confident". A separate model with
+different training data has no stake in the first model's answer, which
+is the one way in this family to catch confidently-wrong-and-consistent.
+
+Scoring prefers the yes-token PROBABILITY over the verifier's verbalized
+score. Verbalized confidences from LLMs are badly calibrated and pile up
+on round numbers (0.8, 0.9, 0.95); P(yes) read off top_logprobs is
+continuous and far better behaved. That is why parsing prefers logprobs
+and falls back to text only when logprobs were not requested -- and why
+callers should send logprobs=True, top_logprobs>=5 on verifier calls.
+
+Pure like the others: prompt construction and response parsing are
+separate functions, so this module still makes no network calls. The
+caller owns the API call in between.
 """
 
 from __future__ import annotations
@@ -71,6 +97,10 @@ AGGREGATIONS = ("mean", "min", "first")
 # Scoring rules for the self-consistency estimator, see
 # estimate_self_consistency_confidence().
 SC_SCORINGS = ("agreement", "entropy")
+
+# Parsing rules for the external-verifier estimator, see
+# estimate_external_verifier_confidence().
+VERIFIER_SCORINGS = ("auto", "logprob", "verbalized", "binary")
 
 
 # ---------------------------------------------------------------------------
@@ -601,3 +631,247 @@ def estimate_self_consistency_confidence(
 def self_consistency_confidence(responses: Any, **kwargs: Any) -> Optional[float]:
     """Just the scalar, for callers that only need TaskRecord.confidence_score."""
     return estimate_self_consistency_confidence(responses, **kwargs).confidence
+
+
+# ---------------------------------------------------------------------------
+# (c) External lightweight verifier
+# ---------------------------------------------------------------------------
+
+# Surface forms of the verdict tokens. Matched after lowercasing and
+# stripping whitespace/punctuation, so "Yes", " yes", and "yes." all hit.
+_YES_TOKENS = frozenset({"yes", "y", "true", "correct", "right", "valid"})
+_NO_TOKENS = frozenset({"no", "n", "false", "incorrect", "wrong", "invalid"})
+
+VERIFIER_SYSTEM_PROMPT = (
+    "You are a strict answer verifier. You will be shown a question and a "
+    "candidate answer produced by another model. Decide whether the "
+    "candidate answer is correct.\n"
+    "Reply with exactly one word: Yes or No. No explanation, no punctuation."
+)
+
+
+def build_verifier_messages(
+    query: str,
+    answer: Optional[str],
+    *,
+    gold_answer: Optional[str] = None,
+    system_prompt: str = VERIFIER_SYSTEM_PROMPT,
+) -> List[Dict[str, str]]:
+    """
+    Chat messages asking a cheap model to verify `answer` to `query`.
+
+    Constrained to a single Yes/No token on purpose. A one-token verdict
+    is what makes the logprob read possible -- P(yes) at position 0 is
+    the calibrated signal, and letting the verifier ramble first buries
+    that token somewhere unpredictable in the stream. It also keeps the
+    verifier's completion cost at one token.
+
+    gold_answer is for OFFLINE ANALYSIS ONLY -- measuring the ceiling of
+    a perfect verifier when scoring a cached dataset. Passing it during a
+    live run leaks the label into the routing decision and invalidates
+    the experiment. It is separately labelled in the prompt so a leak is
+    obvious in a logged trace rather than silent.
+    """
+    user = f"Question:\n{query}\n\nCandidate answer:\n{answer if answer is not None else '(no answer given)'}"
+    if gold_answer is not None:
+        user += f"\n\nReference answer (ORACLE -- offline analysis only):\n{gold_answer}"
+    user += "\n\nIs the candidate answer correct? Answer Yes or No."
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user},
+    ]
+
+
+def _verdict_key(token: Any) -> Optional[str]:
+    """Map a raw token to "yes"/"no", or None if it is neither."""
+    if not isinstance(token, str):
+        return None
+    key = token.strip().lower().strip(_TRAILING_PUNCT).strip()
+    if key in _YES_TOKENS:
+        return "yes"
+    if key in _NO_TOKENS:
+        return "no"
+    return None
+
+
+def yes_probability_from_logprobs(response: Any) -> Optional[float]:
+    """
+    P(yes) at the verifier's first verdict token, from its top_logprobs.
+
+    Walks to the first position whose candidate set contains a yes/no
+    token -- position 0 for a well-behaved verifier, but a stray leading
+    space or newline token should not throw the read away.
+
+    At that position, mass is pooled over all yes-spellings and all
+    no-spellings ("Yes", "yes", "YES", "true" are one outcome, not four —
+    splitting them would understate whichever the model spread across
+    casings) and renormalized over yes+no only. The tail outside the top-k
+    is dropped here rather than lumped: it is a constrained one-token
+    answer, so mass outside yes/no is off-task noise, not a third verdict.
+
+    Returns None when the response carries no logprobs, or when no
+    position offers a yes/no candidate at all.
+    """
+    for entry in extract_token_logprobs(response):
+        pooled = {"yes": 0.0, "no": 0.0}
+        found = False
+
+        top = _get(entry, "top_logprobs")
+        candidates = top if isinstance(top, (list, tuple)) and top else [entry]
+
+        for cand in candidates:
+            key = _verdict_key(_get(cand, "token"))
+            if key is None:
+                continue
+            lp = _get(cand, "logprob")
+            if lp is None:
+                continue
+            pooled[key] += math.exp(float(lp))
+            found = True
+
+        if not found:
+            continue
+
+        total = pooled["yes"] + pooled["no"]
+        if total <= _EPS:
+            continue
+        return min(1.0, max(0.0, pooled["yes"] / total))
+
+    return None
+
+
+def parse_verbalized_confidence(text: Any) -> Optional[float]:
+    """
+    Confidence from the verifier's TEXT, for calls made without logprobs.
+
+    Handles the three shapes a verifier actually emits: a bare verdict
+    ("Yes"), a probability ("0.85"), and a percentage ("85%"). A leading
+    verdict wins over a trailing number, since "No, about 90% of sources
+    disagree" is a NO whose 90% is not a confidence.
+
+    Coarser than the logprob read by construction: a "Yes" collapses to
+    1.0 and a "No" to 0.0, which is exactly the overconfidence that makes
+    verbalized scoring the fallback rather than the default. Returns None
+    when nothing parseable is present.
+    """
+    if text is None:
+        return None
+    if not isinstance(text, str):
+        text = str(text)
+    stripped = text.strip()
+    if not stripped:
+        return None
+
+    first_word = stripped.split()[0] if stripped.split() else ""
+    verdict = _verdict_key(first_word)
+    if verdict is not None:
+        return 1.0 if verdict == "yes" else 0.0
+
+    percent = re.search(r"(\d+(?:\.\d+)?)\s*%", stripped)
+    if percent:
+        return min(1.0, max(0.0, float(percent.group(1)) / 100.0))
+
+    number = re.search(r"[-+]?(?:\d+\.\d+|\.\d+|\d+)", stripped)
+    if number:
+        value = float(number.group(0))
+        if 0.0 <= value <= 1.0:
+            return value
+        if 0.0 <= value <= 100.0:
+            return value / 100.0
+
+    return None
+
+
+def _verifier_text(response: Any) -> Optional[str]:
+    """The verifier's answer text, from any of the shapes we accept."""
+    answers = extract_sampled_answers(response)
+    for a in answers:
+        if isinstance(a, str) and a.strip():
+            return a
+    return None
+
+
+@dataclass
+class ExternalVerifierResult:
+    """Verifier trace for one task.
+
+    ``source`` records WHICH rule produced the number -- "logprob",
+    "verbalized", or "binary". Worth keeping per-record: a run where
+    half the confidences silently came from the coarse text fallback
+    because logprobs were not requested would otherwise look like a
+    calibration result rather than a configuration mistake.
+    """
+    confidence: Optional[float]
+    verdict: Optional[str]
+    source: Optional[str]
+    raw_text: Optional[str] = None
+    method: ConfidenceMethod = ConfidenceMethod.EXTERNAL_LLM
+
+
+def estimate_external_verifier_confidence(
+    response: Any,
+    *,
+    scoring: str = "auto",
+    verdict_threshold: float = 0.5,
+) -> ExternalVerifierResult:
+    """
+    Confidence from a cheap verifier model's judgement of the main
+    model's answer.
+
+    scoring:
+        "auto"       -- P(yes) from logprobs, falling back to the text
+                        rules when the call carried no logprobs. The
+                        default, and what you want in a run where some
+                        calls may be missing logprobs.
+        "logprob"    -- P(yes) only; returns None rather than falling
+                        back. Use when a run is supposed to have logprobs
+                        everywhere and a silent downgrade to the coarse
+                        text rule would corrupt the calibration numbers.
+        "verbalized" -- text rules only (verdict word, "0.85", "85%").
+        "binary"     -- text verdict only, collapsed to 1.0 / 0.0.
+
+    verdict_threshold only labels ``verdict`` for readability; it does
+    not touch ``confidence``. The routing threshold is a separate knob
+    living on TaskRecord.confidence_threshold.
+
+    Returns confidence=None when the response carries nothing usable --
+    missing signal, which compute_ece() drops, not a confident 0.0.
+    """
+    if scoring not in VERIFIER_SCORINGS:
+        raise ValueError(f"scoring must be one of {VERIFIER_SCORINGS}, got {scoring!r}")
+
+    text = _verifier_text(response)
+    confidence: Optional[float] = None
+    source: Optional[str] = None
+
+    if scoring in ("auto", "logprob"):
+        confidence = yes_probability_from_logprobs(response)
+        if confidence is not None:
+            source = "logprob"
+
+    if confidence is None and scoring in ("auto", "verbalized"):
+        confidence = parse_verbalized_confidence(text)
+        if confidence is not None:
+            source = "verbalized"
+
+    if confidence is None and scoring == "binary":
+        verdict_key = _verdict_key(text.split()[0]) if text and text.split() else None
+        if verdict_key is not None:
+            confidence = 1.0 if verdict_key == "yes" else 0.0
+            source = "binary"
+
+    verdict = None
+    if confidence is not None:
+        verdict = "yes" if confidence >= verdict_threshold else "no"
+
+    return ExternalVerifierResult(
+        confidence=confidence,
+        verdict=verdict,
+        source=source,
+        raw_text=text,
+    )
+
+
+def external_verifier_confidence(response: Any, **kwargs: Any) -> Optional[float]:
+    """Just the scalar, for callers that only need TaskRecord.confidence_score."""
+    return estimate_external_verifier_confidence(response, **kwargs).confidence

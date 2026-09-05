@@ -31,6 +31,11 @@ from eval_harness.confidence import (
     self_consistency_confidence,
     extract_sampled_answers,
     normalize_answer,
+    estimate_external_verifier_confidence,
+    external_verifier_confidence,
+    build_verifier_messages,
+    parse_verbalized_confidence,
+    yes_probability_from_logprobs,
 )
 from eval_harness.models import ConfidenceMethod
 
@@ -533,6 +538,255 @@ def test_normalize_answer_directly():
     assert normalize_answer("   ") is None
     assert normalize_answer(42) == "42"           # non-str coerced
     print("test_normalize_answer_directly: PASS")
+
+
+# ---------------------------------------------------------------------------
+# (c) External verifier -- fake-response builders
+# ---------------------------------------------------------------------------
+
+def verdict_response(text, probs=None):
+    """A verifier response: `text` as the message, optional top_logprobs
+    on the first token. `probs` maps token -> probability."""
+    resp = {"choices": [{"message": {"content": text}}]}
+    if probs is not None:
+        resp["choices"][0]["logprobs"] = {"content": [{
+            "token": text.split()[0] if text.split() else text,
+            "logprob": math.log(max(list(probs.values()) + [1e-12])),
+            "top_logprobs": [
+                {"token": t, "logprob": math.log(p) if p > 0 else -100.0}
+                for t, p in probs.items()
+            ],
+        }]}
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# External verifier: prompt construction
+# ---------------------------------------------------------------------------
+
+def test_verifier_messages_shape():
+    msgs = build_verifier_messages("What is 2+2?", "4")
+    assert [m["role"] for m in msgs] == ["system", "user"]
+    assert "2+2" in msgs[1]["content"]
+    assert "4" in msgs[1]["content"]
+    # the Yes/No constraint is what makes the logprob read possible
+    assert "Yes" in msgs[0]["content"] and "No" in msgs[0]["content"]
+    print("test_verifier_messages_shape: PASS")
+
+
+def test_verifier_messages_handle_missing_answer():
+    msgs = build_verifier_messages("What is 2+2?", None)
+    assert "(no answer given)" in msgs[1]["content"]
+    print("test_verifier_messages_handle_missing_answer: PASS")
+
+
+def test_gold_answer_is_labelled_as_oracle():
+    # leaking the label into a live run invalidates the experiment, so it
+    # has to be conspicuous in a logged trace, not silent
+    msgs = build_verifier_messages("q", "a", gold_answer="42")
+    assert "ORACLE" in msgs[1]["content"]
+    assert "42" in msgs[1]["content"]
+    # and absent entirely when not asked for
+    assert "ORACLE" not in build_verifier_messages("q", "a")[1]["content"]
+    print("test_gold_answer_is_labelled_as_oracle: PASS")
+
+
+# ---------------------------------------------------------------------------
+# External verifier: logprob scoring
+# ---------------------------------------------------------------------------
+
+def test_yes_probability_from_logprobs():
+    # P(Yes)=0.8, P(No)=0.2 -> renormalized over yes+no -> 0.8
+    r = estimate_external_verifier_confidence(
+        verdict_response("Yes", {"Yes": 0.8, "No": 0.2})
+    )
+    assert abs(r.confidence - 0.8) < 1e-9
+    assert r.source == "logprob"
+    assert r.verdict == "yes"
+    assert r.method is ConfidenceMethod.EXTERNAL_LLM
+    print("test_yes_probability_from_logprobs: PASS")
+
+
+def test_logprob_renormalizes_over_yes_no_only():
+    # off-task mass ("Maybe") is dropped, not treated as a third verdict:
+    # 0.6 / (0.6 + 0.2) = 0.75
+    r = estimate_external_verifier_confidence(
+        verdict_response("Yes", {"Yes": 0.6, "No": 0.2, "Maybe": 0.2})
+    )
+    assert abs(r.confidence - 0.75) < 1e-9
+    print("test_logprob_renormalizes_over_yes_no_only: PASS")
+
+
+def test_yes_spellings_are_pooled():
+    # "Yes"/"yes"/"YES" are one outcome, not three -- splitting them would
+    # understate a model that spread mass across casings:
+    # (0.3+0.2+0.1) / (0.6 + 0.4) = 0.6
+    r = estimate_external_verifier_confidence(
+        verdict_response("Yes", {"Yes": 0.3, "yes": 0.2, "YES": 0.1, "No": 0.4})
+    )
+    assert abs(r.confidence - 0.6) < 1e-9
+    print("test_yes_spellings_are_pooled: PASS")
+
+
+def test_low_yes_probability_reads_as_no():
+    r = estimate_external_verifier_confidence(
+        verdict_response("No", {"Yes": 0.1, "No": 0.9})
+    )
+    assert abs(r.confidence - 0.1) < 1e-9
+    assert r.verdict == "no"
+    print("test_low_yes_probability_reads_as_no: PASS")
+
+
+def test_logprob_read_skips_leading_non_verdict_token():
+    # a stray newline token before the verdict must not throw the read away
+    resp = {"choices": [{
+        "message": {"content": "Yes"},
+        "logprobs": {"content": [
+            {"token": "\n", "logprob": math.log(0.99),
+             "top_logprobs": [{"token": "\n", "logprob": math.log(0.99)}]},
+            {"token": "Yes", "logprob": math.log(0.7),
+             "top_logprobs": [{"token": "Yes", "logprob": math.log(0.7)},
+                              {"token": "No", "logprob": math.log(0.3)}]},
+        ]},
+    }]}
+    r = estimate_external_verifier_confidence(resp)
+    assert abs(r.confidence - 0.7) < 1e-9
+    assert r.source == "logprob"
+    print("test_logprob_read_skips_leading_non_verdict_token: PASS")
+
+
+def test_logprob_scoring_does_not_fall_back():
+    # scoring="logprob" must return None rather than silently downgrading
+    # to the coarse text rule -- a silent downgrade corrupts calibration
+    r = estimate_external_verifier_confidence(
+        verdict_response("Yes"), scoring="logprob"
+    )
+    assert r.confidence is None
+    assert r.source is None
+    # ...whereas "auto" does fall back, and records that it did
+    r_auto = estimate_external_verifier_confidence(verdict_response("Yes"))
+    assert r_auto.confidence == 1.0
+    assert r_auto.source == "verbalized"
+    print("test_logprob_scoring_does_not_fall_back: PASS")
+
+
+def test_logprob_preferred_over_text_when_both_present():
+    # text says a flat "Yes" (would be 1.0); logprobs say 0.65 -- the
+    # calibrated number must win
+    r = estimate_external_verifier_confidence(
+        verdict_response("Yes", {"Yes": 0.65, "No": 0.35})
+    )
+    assert abs(r.confidence - 0.65) < 1e-9
+    assert r.source == "logprob"
+    print("test_logprob_preferred_over_text_when_both_present: PASS")
+
+
+# ---------------------------------------------------------------------------
+# External verifier: verbalized scoring
+# ---------------------------------------------------------------------------
+
+def test_verbalized_verdict_words():
+    assert parse_verbalized_confidence("Yes") == 1.0
+    assert parse_verbalized_confidence("no") == 0.0
+    assert parse_verbalized_confidence("  Correct.  ") == 1.0
+    assert parse_verbalized_confidence("Incorrect") == 0.0
+    print("test_verbalized_verdict_words: PASS")
+
+
+def test_verbalized_numeric_scores():
+    assert abs(parse_verbalized_confidence("0.85") - 0.85) < 1e-9
+    assert abs(parse_verbalized_confidence("85%") - 0.85) < 1e-9
+    assert abs(parse_verbalized_confidence("Confidence: 72%") - 0.72) < 1e-9
+    print("test_verbalized_numeric_scores: PASS")
+
+
+def test_leading_verdict_beats_trailing_number():
+    # "No, about 90% of sources disagree" is a NO; the 90% is not a
+    # confidence and must not be read as one
+    assert parse_verbalized_confidence("No, about 90% of sources disagree") == 0.0
+    print("test_leading_verdict_beats_trailing_number: PASS")
+
+
+def test_verbalized_unparseable_returns_none():
+    assert parse_verbalized_confidence("I cannot determine this") is None
+    assert parse_verbalized_confidence("") is None
+    assert parse_verbalized_confidence(None) is None
+    print("test_verbalized_unparseable_returns_none: PASS")
+
+
+def test_binary_scoring_collapses_to_extremes():
+    r = estimate_external_verifier_confidence(verdict_response("Yes"), scoring="binary")
+    assert r.confidence == 1.0 and r.source == "binary"
+    r2 = estimate_external_verifier_confidence(verdict_response("No"), scoring="binary")
+    assert r2.confidence == 0.0
+    print("test_binary_scoring_collapses_to_extremes: PASS")
+
+
+# ---------------------------------------------------------------------------
+# External verifier: missing signal + API surface
+# ---------------------------------------------------------------------------
+
+def test_unusable_verifier_response_returns_none():
+    # missing signal, not a confident 0.0
+    r = estimate_external_verifier_confidence(verdict_response("I don't know"))
+    assert r.confidence is None
+    assert r.verdict is None
+    assert r.source is None
+    assert estimate_external_verifier_confidence(None).confidence is None
+    print("test_unusable_verifier_response_returns_none: PASS")
+
+
+def test_source_records_which_rule_fired():
+    # a run that silently used the coarse fallback everywhere should be
+    # diagnosable from the records, not look like a calibration result
+    with_lp = estimate_external_verifier_confidence(
+        verdict_response("Yes", {"Yes": 0.9, "No": 0.1})
+    )
+    without_lp = estimate_external_verifier_confidence(verdict_response("Yes"))
+    assert with_lp.source == "logprob"
+    assert without_lp.source == "verbalized"
+    print("test_source_records_which_rule_fired: PASS")
+
+
+def test_verifier_reads_sdk_object_shape():
+    resp = SimpleNamespace(choices=[SimpleNamespace(
+        message=SimpleNamespace(content="Yes"),
+        logprobs=SimpleNamespace(content=[SimpleNamespace(
+            token="Yes", logprob=math.log(0.75),
+            top_logprobs=[SimpleNamespace(token="Yes", logprob=math.log(0.75)),
+                          SimpleNamespace(token="No", logprob=math.log(0.25))],
+        )]),
+    )])
+    r = estimate_external_verifier_confidence(resp)
+    assert abs(r.confidence - 0.75) < 1e-9
+    print("test_verifier_reads_sdk_object_shape: PASS")
+
+
+def test_verdict_threshold_labels_only():
+    # threshold moves the label, never the number
+    resp = verdict_response("Yes", {"Yes": 0.6, "No": 0.4})
+    low = estimate_external_verifier_confidence(resp, verdict_threshold=0.5)
+    high = estimate_external_verifier_confidence(resp, verdict_threshold=0.9)
+    assert low.verdict == "yes" and high.verdict == "no"
+    assert abs(low.confidence - high.confidence) < 1e-12
+    print("test_verdict_threshold_labels_only: PASS")
+
+
+def test_verifier_rejects_unknown_scoring():
+    try:
+        estimate_external_verifier_confidence(verdict_response("Yes"), scoring="vibes")
+    except ValueError:
+        print("test_verifier_rejects_unknown_scoring: PASS")
+        return
+    raise AssertionError("expected ValueError for unknown scoring")
+
+
+def test_verifier_scalar_wrapper_matches_full_result():
+    resp = verdict_response("Yes", {"Yes": 0.7, "No": 0.3})
+    assert external_verifier_confidence(resp) == (
+        estimate_external_verifier_confidence(resp).confidence
+    )
+    print("test_verifier_scalar_wrapper_matches_full_result: PASS")
 
 
 def run_all():
