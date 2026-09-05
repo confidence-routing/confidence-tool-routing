@@ -16,7 +16,7 @@ Estimators (built in order):
     (a) token entropy      -- THIS FILE, below
     (b) self-consistency   -- THIS FILE, below
     (c) external verifier  -- THIS FILE, below
-    (d) hybrid combiner    -- next
+    (d) hybrid combiner    -- THIS FILE, below
 
 --- (a) Token-entropy estimator ---------------------------------------
 
@@ -76,6 +76,26 @@ callers should send logprobs=True, top_logprobs>=5 on verifier calls.
 Pure like the others: prompt construction and response parsing are
 separate functions, so this module still makes no network calls. The
 caller owns the API call in between.
+
+--- (d) Hybrid combiner ------------------------------------------------
+
+Combines (a), (b) and (c) into one score. No new signal of its own --
+it takes the numbers the other three produced and mixes them, so it is
+pure in the same sense and costs nothing beyond the calls already made.
+
+Two rules, and the choice is the experiment rather than a default worth
+defending. The weighted mean asks "on balance, how sure are we"; the min
+asks "is ANY estimator unsure", which is what the router actually wants,
+because the expensive failure mode is a confident-and-wrong direct
+answer, not an unnecessary tool call.
+
+The convention that a missing signal is None rather than 0.0 carries
+real weight here. A verifier call that returned no logprobs is an
+absent opinion, not a vote of no confidence, so the weighted mean
+renormalizes over the signals that are present instead of letting an
+absence drag the score down. The result keeps ``used`` and ``missing``
+for exactly this reason: a "hybrid" number computed from one surviving
+signal needs to be visibly that in the logs, not silently averaged.
 """
 
 from __future__ import annotations
@@ -101,6 +121,10 @@ SC_SCORINGS = ("agreement", "entropy")
 # Parsing rules for the external-verifier estimator, see
 # estimate_external_verifier_confidence().
 VERIFIER_SCORINGS = ("auto", "logprob", "verbalized", "binary")
+
+# Combination rules for the hybrid combiner, see
+# estimate_hybrid_confidence().
+HYBRID_COMBINERS = ("mean", "min")
 
 
 # ---------------------------------------------------------------------------
@@ -875,3 +899,119 @@ def estimate_external_verifier_confidence(
 def external_verifier_confidence(response: Any, **kwargs: Any) -> Optional[float]:
     """Just the scalar, for callers that only need TaskRecord.confidence_score."""
     return estimate_external_verifier_confidence(response, **kwargs).confidence
+
+
+# ---------------------------------------------------------------------------
+# (d) Hybrid combiner
+# ---------------------------------------------------------------------------
+
+def _signal_value(signal: Any) -> Optional[float]:
+    """Accept either a raw float or any of the estimator result objects."""
+    value = getattr(signal, "confidence", signal)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"signal must be a number, None, or an estimator result, got {signal!r}")
+    if value != value or value in (float("inf"), float("-inf")):
+        raise ValueError(f"signal must be finite, got {value!r}")
+    return min(1.0, max(0.0, float(value)))
+
+
+@dataclass
+class HybridConfidenceResult:
+    """Combined confidence plus which signals actually contributed.
+
+    ``used`` and ``missing`` matter more here than in the single-signal
+    estimators: a hybrid that quietly degraded to one signal because the
+    other two were None still returns a number, and without the trace
+    that run looks like a hybrid result rather than the entropy result
+    it really is.
+    """
+    confidence: Optional[float]
+    used: Dict[str, float] = field(default_factory=dict)
+    missing: List[str] = field(default_factory=list)
+    weights: Dict[str, float] = field(default_factory=dict)
+    combine: str = "mean"
+    method: ConfidenceMethod = ConfidenceMethod.HYBRID
+
+
+def estimate_hybrid_confidence(
+    signals: Dict[Any, Any],
+    *,
+    weights: Optional[Dict[Any, float]] = None,
+    combine: str = "mean",
+) -> HybridConfidenceResult:
+    """
+    Combine the confidences from (a), (b) and (c) into one score.
+
+    ``signals`` maps a name -- a ConfidenceMethod or a plain string -- to
+    either a raw float or the result object from any estimator above, so
+    the three can be passed through directly.
+
+    combine:
+        "mean" -- weighted mean over the signals that are present
+                  (default). Weights are renormalized over the present
+                  ones, so a missing signal shifts the mix rather than
+                  dragging the score toward zero.
+        "min"  -- the lowest present signal, ignoring weights.
+                  Conservative: the router escalates to a tool if ANY
+                  estimator is unsure. This is the variant that matters
+                  for the cost experiment, since a confidently-wrong
+                  direct answer is the expensive failure.
+
+    A None signal means MISSING, not zero -- same convention as the
+    single-signal estimators, and the reason the weighted mean
+    renormalizes instead of treating an absent verifier as a no vote.
+    Returns confidence=None when every signal is missing.
+    """
+    if combine not in HYBRID_COMBINERS:
+        raise ValueError(f"combine must be one of {HYBRID_COMBINERS}, got {combine!r}")
+
+    used: Dict[str, float] = {}
+    missing: List[str] = []
+    for name, signal in signals.items():
+        key = name.value if isinstance(name, ConfidenceMethod) else str(name)
+        value = _signal_value(signal)
+        if value is None:
+            missing.append(key)
+        else:
+            used[key] = value
+
+    if not used:
+        return HybridConfidenceResult(
+            confidence=None,
+            used={},
+            missing=missing,
+            weights={},
+            combine=combine,
+        )
+
+    raw_weights = {} if weights is None else {
+        (n.value if isinstance(n, ConfidenceMethod) else str(n)): float(w)
+        for n, w in weights.items()
+    }
+    present_weights = {k: raw_weights.get(k, 1.0) for k in used}
+    if any(w < 0 for w in present_weights.values()):
+        raise ValueError(f"weights must be non-negative, got {present_weights!r}")
+
+    total = sum(present_weights.values())
+    if total <= 0:
+        raise ValueError("weights over the present signals sum to zero; nothing to combine")
+
+    if combine == "min":
+        confidence = min(used.values())
+    else:
+        confidence = sum(used[k] * present_weights[k] for k in used) / total
+
+    return HybridConfidenceResult(
+        confidence=min(1.0, max(0.0, confidence)),
+        used=used,
+        missing=missing,
+        weights={k: w / total for k, w in present_weights.items()},
+        combine=combine,
+    )
+
+
+def hybrid_confidence(signals: Dict[Any, Any], **kwargs: Any) -> Optional[float]:
+    """Just the scalar, for callers that only need TaskRecord.confidence_score."""
+    return estimate_hybrid_confidence(signals, **kwargs).confidence
