@@ -27,6 +27,10 @@ from eval_harness.confidence import (
     token_entropy_confidence,
     normalized_token_entropy,
     extract_token_logprobs,
+    estimate_self_consistency_confidence,
+    self_consistency_confidence,
+    extract_sampled_answers,
+    normalize_answer,
 )
 from eval_harness.models import ConfidenceMethod
 
@@ -264,6 +268,271 @@ def test_rejects_unknown_aggregation():
         print("test_rejects_unknown_aggregation: PASS")
         return
     raise AssertionError("expected ValueError for unknown aggregation")
+
+
+# ---------------------------------------------------------------------------
+# (b) Self-consistency -- fake-response builders
+# ---------------------------------------------------------------------------
+
+def sampled(*answers):
+    """One response sampled with n=k: choices[*].message.content."""
+    return {"choices": [{"message": {"content": a}} for a in answers]}
+
+
+def separate_calls(*answers):
+    """k separate single-choice responses, the other shape callers use."""
+    return [{"choices": [{"message": {"content": a}}]} for a in answers]
+
+
+# ---------------------------------------------------------------------------
+# Self-consistency: agreement scoring
+# ---------------------------------------------------------------------------
+
+def test_unanimous_samples_are_fully_confident():
+    # 5/5 agree -> agreement 1.0
+    r = estimate_self_consistency_confidence(["42", "42", "42", "42", "42"])
+    assert r.confidence == 1.0
+    assert r.consensus_answer == "42"
+    assert r.n_samples == 5
+    assert r.method is ConfidenceMethod.SELF_CONSISTENCY
+    print("test_unanimous_samples_are_fully_confident: PASS")
+
+
+def test_majority_agreement_rate():
+    # 3 of 5 agree on "42" -> 0.6, and the consensus is the majority answer
+    r = estimate_self_consistency_confidence(["42", "42", "42", "43", "44"])
+    assert abs(r.confidence - 0.6) < 1e-9
+    assert r.consensus_answer == "42"
+    assert r.vote_counts[0] == ("42", 3)
+    print("test_majority_agreement_rate: PASS")
+
+
+def test_total_disagreement_is_floor():
+    # k distinct answers -> agreement 1/k, the floor, never 0
+    r = estimate_self_consistency_confidence(["a", "b", "c", "d"])
+    assert abs(r.confidence - 0.25) < 1e-9
+    print("test_total_disagreement_is_floor: PASS")
+
+
+def test_ties_break_by_first_appearance():
+    # 2-2 tie: "b" appears first, so it wins deterministically regardless
+    # of dict/Counter ordering
+    r = estimate_self_consistency_confidence(["b", "a", "b", "a"])
+    assert r.consensus_answer == "b"
+    assert abs(r.agreement_rate - 0.5) < 1e-9
+    # same votes, reversed order -> the other answer wins, still deterministic
+    r2 = estimate_self_consistency_confidence(["a", "b", "a", "b"])
+    assert r2.consensus_answer == "a"
+    print("test_ties_break_by_first_appearance: PASS")
+
+
+# ---------------------------------------------------------------------------
+# Self-consistency: answer normalization
+# ---------------------------------------------------------------------------
+
+def test_normalization_buckets_equivalent_spellings():
+    # all five of these are the same answer; an over-strict comparison
+    # would report 1/5 agreement and make the model look uncalibrated
+    r = estimate_self_consistency_confidence(
+        ["42", " 42 ", "42.", "The answer is 42", "Final answer: 42"]
+    )
+    assert r.confidence == 1.0, r.vote_counts
+    assert r.consensus_answer == "42"
+    print("test_normalization_buckets_equivalent_spellings: PASS")
+
+
+def test_numeric_spellings_are_canonicalized():
+    # "$1,234.00" == "1234" == "1234.0"
+    r = estimate_self_consistency_confidence(["$1,234.00", "1234", "1234.0"])
+    assert r.confidence == 1.0, r.vote_counts
+    assert r.consensus_answer == "1234"
+    print("test_numeric_spellings_are_canonicalized: PASS")
+
+
+def test_normalization_is_case_insensitive():
+    r = estimate_self_consistency_confidence(["Paris", "paris", "PARIS"])
+    assert r.confidence == 1.0
+    assert r.consensus_answer == "paris"
+    print("test_normalization_is_case_insensitive: PASS")
+
+
+def test_distinct_answers_stay_distinct():
+    # normalization must not over-merge: 42 and 43 are different answers
+    r = estimate_self_consistency_confidence(["42", "43"])
+    assert abs(r.confidence - 0.5) < 1e-9
+    assert len(r.vote_counts) == 2
+    print("test_distinct_answers_stay_distinct: PASS")
+
+
+def test_custom_normalizer_is_honored():
+    # a task-specific grader: bucket by first character only
+    r = estimate_self_consistency_confidence(
+        ["apple", "avocado", "banana"], normalizer=lambda s: s[0] if s else None
+    )
+    assert abs(r.confidence - (2 / 3)) < 1e-9
+    assert r.consensus_answer == "a"
+    print("test_custom_normalizer_is_honored: PASS")
+
+
+# ---------------------------------------------------------------------------
+# Self-consistency: missing / unusable samples
+# ---------------------------------------------------------------------------
+
+def test_blank_samples_are_skipped_not_voted():
+    # None and "" must not become a vote for the empty answer: 2 valid
+    # samples both saying 42 -> 1.0, with 2 skipped recorded
+    r = estimate_self_consistency_confidence(["42", None, "42", "   "])
+    assert r.confidence == 1.0
+    assert r.n_samples == 2
+    assert r.n_skipped == 2
+    print("test_blank_samples_are_skipped_not_voted: PASS")
+
+
+def test_no_usable_samples_returns_none():
+    # missing signal, not a confident-wrong 0.0 -- compute_ece drops None
+    r = estimate_self_consistency_confidence([None, "", "  "])
+    assert r.confidence is None
+    assert r.consensus_answer is None
+    assert r.agreement_rate is None
+    assert r.n_skipped == 3
+    print("test_no_usable_samples_returns_none: PASS")
+
+
+def test_empty_input_returns_none():
+    assert estimate_self_consistency_confidence([]).confidence is None
+    assert estimate_self_consistency_confidence(None).confidence is None
+    print("test_empty_input_returns_none: PASS")
+
+
+# ---------------------------------------------------------------------------
+# Self-consistency: response shapes
+# ---------------------------------------------------------------------------
+
+def test_reads_n_equals_k_response_shape():
+    # one request sampled n=4
+    r = estimate_self_consistency_confidence(sampled("42", "42", "42", "7"))
+    assert abs(r.confidence - 0.75) < 1e-9
+    assert r.consensus_answer == "42"
+    print("test_reads_n_equals_k_response_shape: PASS")
+
+
+def test_reads_separate_call_response_shape():
+    # k separate single-choice responses
+    r = estimate_self_consistency_confidence(separate_calls("42", "42", "7", "7"))
+    assert r.n_samples == 4
+    assert abs(r.agreement_rate - 0.5) < 1e-9
+    print("test_reads_separate_call_response_shape: PASS")
+
+
+def test_reads_sdk_object_shape():
+    # the SDK returns pydantic objects, not dicts -- same attribute path
+    resp = SimpleNamespace(choices=[
+        SimpleNamespace(message=SimpleNamespace(content="42")),
+        SimpleNamespace(message=SimpleNamespace(content="42")),
+    ])
+    r = estimate_self_consistency_confidence(resp)
+    assert r.confidence == 1.0
+    assert r.n_samples == 2
+    print("test_reads_sdk_object_shape: PASS")
+
+
+def test_extract_sampled_answers_shapes():
+    assert extract_sampled_answers(["a", "b"]) == ["a", "b"]
+    assert extract_sampled_answers("a") == ["a"]
+    assert extract_sampled_answers(sampled("a", "b")) == ["a", "b"]
+    assert extract_sampled_answers(separate_calls("a", "b")) == ["a", "b"]
+    assert extract_sampled_answers(None) == []
+    print("test_extract_sampled_answers_shapes: PASS")
+
+
+# ---------------------------------------------------------------------------
+# Self-consistency: entropy scoring
+# ---------------------------------------------------------------------------
+
+def test_entropy_scoring_penalizes_scatter_below_clean_tie():
+    # this is the whole reason entropy scoring exists, and the reason it
+    # normalizes by log(k) rather than log(distinct answers).
+    # 10 samples, 5-5 against one rival:
+    #   H = ln2 = 0.6931, /ln10 = 0.3010 -> confidence 0.6990
+    # 10 samples, 5 vs five singletons:
+    #   H = 0.5*ln2 + 5*(0.1*ln10) = 1.4979, /ln10 = 0.6505 -> 0.3495
+    # both are 0.5 agreement; the scatter must score strictly lower.
+    tie = ["a"] * 5 + ["b"] * 5
+    scatter = ["a"] * 5 + ["b", "c", "d", "e", "f"]
+
+    r_tie = estimate_self_consistency_confidence(tie, scoring="entropy")
+    r_scatter = estimate_self_consistency_confidence(scatter, scoring="entropy")
+
+    assert abs(r_tie.confidence - 0.6990) < 1e-3, r_tie.confidence
+    assert abs(r_scatter.confidence - 0.3495) < 1e-3, r_scatter.confidence
+    assert r_scatter.confidence < r_tie.confidence
+
+    # agreement scoring cannot tell them apart -- that is the gap being filled
+    assert abs(r_tie.agreement_rate - r_scatter.agreement_rate) < 1e-9
+    print("test_entropy_scoring_penalizes_scatter_below_clean_tie: PASS")
+
+
+def test_entropy_scoring_unanimous_is_one():
+    r = estimate_self_consistency_confidence(["42"] * 8, scoring="entropy")
+    assert abs(r.confidence - 1.0) < 1e-9
+    print("test_entropy_scoring_unanimous_is_one: PASS")
+
+
+def test_entropy_scoring_all_distinct_is_zero():
+    # k samples, k distinct answers -> H = ln(k) -> normalized 1.0 -> conf 0
+    r = estimate_self_consistency_confidence(["a", "b", "c", "d"], scoring="entropy")
+    assert abs(r.confidence - 0.0) < 1e-9
+    print("test_entropy_scoring_all_distinct_is_zero: PASS")
+
+
+def test_entropy_and_agreement_agree_at_the_extremes():
+    # the two rules only diverge in the middle; unanimity is 1.0 for both
+    unanimous = ["x"] * 6
+    assert estimate_self_consistency_confidence(unanimous).confidence == 1.0
+    assert abs(
+        estimate_self_consistency_confidence(unanimous, scoring="entropy").confidence - 1.0
+    ) < 1e-9
+    print("test_entropy_and_agreement_agree_at_the_extremes: PASS")
+
+
+def test_single_sample_scores_one_under_both_rules():
+    # documented caveat: k=1 always agrees with itself and carries no
+    # self-consistency signal -- must not crash on log(1) either
+    assert estimate_self_consistency_confidence(["42"]).confidence == 1.0
+    assert estimate_self_consistency_confidence(["42"], scoring="entropy").confidence == 1.0
+    print("test_single_sample_scores_one_under_both_rules: PASS")
+
+
+# ---------------------------------------------------------------------------
+# Self-consistency: API surface
+# ---------------------------------------------------------------------------
+
+def test_rejects_unknown_scoring():
+    try:
+        estimate_self_consistency_confidence(["a"], scoring="majority")
+    except ValueError:
+        print("test_rejects_unknown_scoring: PASS")
+        return
+    raise AssertionError("expected ValueError for unknown scoring")
+
+
+def test_scalar_wrapper_matches_full_result():
+    samples = ["42", "42", "7"]
+    assert self_consistency_confidence(samples) == (
+        estimate_self_consistency_confidence(samples).confidence
+    )
+    print("test_scalar_wrapper_matches_full_result: PASS")
+
+
+def test_normalize_answer_directly():
+    assert normalize_answer("  The answer is 42.  ") == "42"
+    assert normalize_answer("1,000") == "1000"
+    assert normalize_answer("3.50") == "3.5"
+    assert normalize_answer("f(x)") == "f(x)"     # closing paren is content
+    assert normalize_answer(None) is None
+    assert normalize_answer("   ") is None
+    assert normalize_answer(42) == "42"           # non-str coerced
+    print("test_normalize_answer_directly: PASS")
 
 
 def run_all():
