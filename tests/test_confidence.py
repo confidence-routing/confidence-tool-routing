@@ -23,6 +23,9 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from eval_harness.confidence import (
+    estimate_hybrid_confidence,
+    hybrid_confidence,
+    HYBRID_COMBINERS,
     estimate_entropy_confidence,
     token_entropy_confidence,
     normalized_token_entropy,
@@ -787,6 +790,179 @@ def test_verifier_scalar_wrapper_matches_full_result():
         estimate_external_verifier_confidence(resp).confidence
     )
     print("test_verifier_scalar_wrapper_matches_full_result: PASS")
+
+
+# ---------------------------------------------------------------------------
+# (d) Hybrid combiner
+# ---------------------------------------------------------------------------
+
+def test_hybrid_equal_weights_is_plain_mean():
+    # (0.9 + 0.6 + 0.3) / 3 = 0.6
+    r = estimate_hybrid_confidence({"a": 0.9, "b": 0.6, "c": 0.3})
+    assert abs(r.confidence - 0.6) < 1e-12
+    assert r.method == ConfidenceMethod.HYBRID
+    assert r.missing == []
+    print("test_hybrid_equal_weights_is_plain_mean: PASS")
+
+
+def test_hybrid_weighted_mean():
+    # (0.8*3 + 0.4*1) / 4 = 2.8 / 4 = 0.7
+    r = estimate_hybrid_confidence(
+        {"entropy": 0.8, "verifier": 0.4},
+        weights={"entropy": 3.0, "verifier": 1.0},
+    )
+    assert abs(r.confidence - 0.7) < 1e-12
+    # Reported weights are renormalized to sum to 1.
+    assert abs(r.weights["entropy"] - 0.75) < 1e-12
+    assert abs(sum(r.weights.values()) - 1.0) < 1e-12
+    print("test_hybrid_weighted_mean: PASS")
+
+
+def test_hybrid_missing_signal_renormalizes_rather_than_counting_as_zero():
+    # The verifier is absent, not negative. Mean over the two present
+    # signals is 0.7 -- NOT (0.8 + 0.6 + 0) / 3 = 0.466...
+    r = estimate_hybrid_confidence({"a": 0.8, "b": 0.6, "verifier": None})
+    assert abs(r.confidence - 0.7) < 1e-12
+    assert r.missing == ["verifier"]
+    assert set(r.used) == {"a", "b"}
+    assert abs(sum(r.weights.values()) - 1.0) < 1e-12
+    print("test_hybrid_missing_signal_renormalizes_rather_than_counting_as_zero: PASS")
+
+
+def test_hybrid_missing_signal_drops_its_weight_too():
+    # Weighted mean with the heavy signal absent must fall back to the
+    # light one alone, not scale it by its original small weight.
+    r = estimate_hybrid_confidence(
+        {"heavy": None, "light": 0.5},
+        weights={"heavy": 9.0, "light": 1.0},
+    )
+    assert abs(r.confidence - 0.5) < 1e-12
+    assert r.weights == {"light": 1.0}
+    print("test_hybrid_missing_signal_drops_its_weight_too: PASS")
+
+
+def test_hybrid_all_missing_returns_none_not_zero():
+    r = estimate_hybrid_confidence({"a": None, "b": None})
+    assert r.confidence is None
+    assert r.used == {}
+    assert sorted(r.missing) == ["a", "b"]
+    print("test_hybrid_all_missing_returns_none_not_zero: PASS")
+
+
+def test_hybrid_empty_signals_returns_none():
+    assert estimate_hybrid_confidence({}).confidence is None
+    print("test_hybrid_empty_signals_returns_none: PASS")
+
+
+def test_hybrid_min_takes_the_least_confident_signal():
+    r = estimate_hybrid_confidence({"a": 0.9, "b": 0.2, "c": 0.7}, combine="min")
+    assert r.confidence == 0.2
+    print("test_hybrid_min_takes_the_least_confident_signal: PASS")
+
+
+def test_hybrid_min_ignores_weights():
+    # Weighting the confident signal heavily must not rescue the score:
+    # "is ANY estimator unsure" is the whole point of the min rule.
+    r = estimate_hybrid_confidence(
+        {"a": 0.9, "b": 0.2},
+        weights={"a": 100.0, "b": 1.0},
+        combine="min",
+    )
+    assert r.confidence == 0.2
+    print("test_hybrid_min_ignores_weights: PASS")
+
+
+def test_hybrid_min_skips_missing_signals():
+    r = estimate_hybrid_confidence({"a": 0.4, "b": None}, combine="min")
+    assert r.confidence == 0.4
+    assert r.missing == ["b"]
+    print("test_hybrid_min_skips_missing_signals: PASS")
+
+
+def test_hybrid_accepts_estimator_result_objects_directly():
+    # The three estimators' results are passed straight through; the
+    # combiner reads .confidence off each rather than needing scalars.
+    entropy = estimate_entropy_confidence(
+        response([token("A", [0.7, 0.3])])
+    )
+    verifier = estimate_external_verifier_confidence(
+        verdict_response("Yes", {"Yes": 0.75, "No": 0.25})
+    )
+    r = estimate_hybrid_confidence(
+        {ConfidenceMethod.ENTROPY: entropy, ConfidenceMethod.EXTERNAL_LLM: verifier}
+    )
+    # Keys come out as the enum's string value, not repr(enum).
+    assert set(r.used) == {"entropy", "external_llm"}
+    expected = (entropy.confidence + verifier.confidence) / 2
+    assert abs(r.confidence - expected) < 1e-12
+    print("test_hybrid_accepts_estimator_result_objects_directly: PASS")
+
+
+def test_hybrid_clamps_out_of_range_signals():
+    r = estimate_hybrid_confidence({"a": 1.4, "b": -0.2})
+    # Clamped to 1.0 and 0.0 before averaging -> 0.5, and never outside [0, 1].
+    assert abs(r.confidence - 0.5) < 1e-12
+    assert 0.0 <= r.confidence <= 1.0
+    print("test_hybrid_clamps_out_of_range_signals: PASS")
+
+
+def test_hybrid_rejects_unknown_combine():
+    try:
+        estimate_hybrid_confidence({"a": 0.5}, combine="median")
+    except ValueError:
+        print("test_hybrid_rejects_unknown_combine: PASS")
+        return
+    raise AssertionError("expected ValueError for unknown combine")
+
+
+def test_hybrid_rejects_negative_weight():
+    try:
+        estimate_hybrid_confidence({"a": 0.5}, weights={"a": -1.0})
+    except ValueError:
+        print("test_hybrid_rejects_negative_weight: PASS")
+        return
+    raise AssertionError("expected ValueError for negative weight")
+
+
+def test_hybrid_rejects_all_zero_weights():
+    # Would be a divide-by-zero rather than a meaningful combination.
+    try:
+        estimate_hybrid_confidence({"a": 0.5, "b": 0.5}, weights={"a": 0.0, "b": 0.0})
+    except ValueError:
+        print("test_hybrid_rejects_all_zero_weights: PASS")
+        return
+    raise AssertionError("expected ValueError for zero total weight")
+
+
+def test_hybrid_rejects_non_numeric_signal():
+    try:
+        estimate_hybrid_confidence({"a": "0.5"})
+    except TypeError:
+        print("test_hybrid_rejects_non_numeric_signal: PASS")
+        return
+    raise AssertionError("expected TypeError for a string signal")
+
+
+def test_hybrid_rejects_nan_signal():
+    # NaN would propagate silently through the mean and poison ECE.
+    try:
+        estimate_hybrid_confidence({"a": float("nan")})
+    except ValueError:
+        print("test_hybrid_rejects_nan_signal: PASS")
+        return
+    raise AssertionError("expected ValueError for NaN signal")
+
+
+def test_hybrid_combiners_tuple_matches_accepted_values():
+    for rule in HYBRID_COMBINERS:
+        estimate_hybrid_confidence({"a": 0.5}, combine=rule)
+    print("test_hybrid_combiners_tuple_matches_accepted_values: PASS")
+
+
+def test_hybrid_scalar_wrapper_matches_full_result():
+    signals = {"a": 0.9, "b": 0.3}
+    assert hybrid_confidence(signals) == estimate_hybrid_confidence(signals).confidence
+    print("test_hybrid_scalar_wrapper_matches_full_result: PASS")
 
 
 def run_all():
