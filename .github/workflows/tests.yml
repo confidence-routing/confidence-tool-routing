@@ -34,9 +34,9 @@ jobs:
       # without noticing, so exercise it too.
       - name: Run standalone test runners (no pytest)
         run: |
-          python -m tests.test_metrics
-          python -m tests.test_costs
-          python -m tests.test_confidence
+          for f in tests/test_*.py; do
+            python -m "tests.$(basename "$f" .py)"
+          done
 
       - name: Smoke-test the example run
         run: python -m examples.dummy_run

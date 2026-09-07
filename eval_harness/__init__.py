@@ -11,6 +11,9 @@ Core pieces:
     - metrics.py  CPST, ECE (per-tool + aggregate), routing precision/recall,
                   unnecessary/missed tool-call rate, latency breakdown
     - report.py   Turns a run's records into a summary dict / printable report
+    - confidence.py  Confidence estimators: entropy, self-consistency,
+                  external verifier, hybrid combiner
+    - router.py   The routing decision itself + threshold selection
 """
 
 from .models import TaskRecord, ToolType, ToolNecessity
@@ -25,6 +28,7 @@ from .metrics import (
     compute_latency_breakdown,
 )
 from .report import build_report, print_report
+from .router import route, route_record, sweep_thresholds, select_threshold
 
 __all__ = [
     "TaskRecord",
@@ -40,4 +44,8 @@ __all__ = [
     "compute_latency_breakdown",
     "build_report",
     "print_report",
+    "route",
+    "route_record",
+    "sweep_thresholds",
+    "select_threshold",
 ]
