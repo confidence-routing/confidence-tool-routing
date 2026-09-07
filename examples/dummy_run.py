@@ -26,6 +26,7 @@ from eval_harness import (
     build_report, print_report,
 )
 from eval_harness.models import ConfidenceMethod, RoutingDecision, LatencyBreakdown
+from eval_harness.router import route, select_threshold, sweep_thresholds
 
 RNG = random.Random(42)
 
@@ -55,7 +56,7 @@ def simulate_task(task_id: int, tool_category: ToolType) -> TaskRecord:
     confidence = min(1.0, max(0.0, true_quality + RNG.gauss(0.08, 0.12)))
 
     threshold = 0.7
-    routed_to_tool = confidence < threshold
+    routed_to_tool = route(confidence, threshold) == RoutingDecision.TOOL
 
     tool_called = routed_to_tool
     tool_used = tool_category if tool_called else ToolType.NONE
@@ -127,6 +128,23 @@ def main() -> None:
         ece_group_by=lambda r: r.meta.get("task_tool_category", r.tool_used.value),
     )
     print_report(report, title="Dummy Run — Confidence-Based Tool Routing")
+
+    # What the router would have done at other cuts. The run above used
+    # 0.7 throughout; this is how the operating point gets picked from a
+    # pilot instead of by taste. No CPST column -- correctness under a
+    # decision the run never took is not in the log. See router.py.
+    print("\nThreshold sweep (routing quality only):")
+    print(f"  {'thresh':>6}  {'prec':>5}  {'recall':>6}  {'f1':>5}  {'unnec':>6}  {'missed':>6}  {'tools':>5}")
+    for pt in sweep_thresholds(records, [0.3, 0.5, 0.6, 0.7, 0.8, 0.9]):
+        fmt = lambda v: f"{v:.3f}" if v is not None else "  -  "
+        print(f"  {pt.threshold:>6.2f}  {fmt(pt.precision):>5}  {fmt(pt.recall):>6}  "
+              f"{fmt(pt.f1):>5}  {fmt(pt.unnecessary_call_rate):>6}  "
+              f"{fmt(pt.missed_call_rate):>6}  {pt.n_tool:>5}")
+
+    best = select_threshold(records)
+    if best is not None:
+        print(f"\n  best F1 at threshold {best.threshold:.2f} "
+              f"(f1={best.f1:.3f}, {best.n_tool} tool calls of {len(records)})")
 
 
 if __name__ == "__main__":
