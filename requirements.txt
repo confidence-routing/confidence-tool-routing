@@ -1,6 +1,14 @@
-# Phase 1 (eval harness) uses only the Python standard library.
-# Uncomment/add as later phases need them:
+# The harness itself is stdlib-only: models, costs, logger, metrics,
+# report, confidence, router, tools and grading all run with no
+# third-party package, and the whole test suite passes without one.
+#
+# The single exception is client.py, which has to talk to a provider.
+# It is imported lazily, so everything else still works without this
+# installed -- including every test, which drives the runner with a
+# scripted stub rather than a live call.
 
-# openai>=1.0.0          # Phase 2: main LLM + external verifier calls
-# tiktoken>=0.7.0         # Phase 2: token counting before API calls
-# pytest>=7.0.0           # recommended for running tests/
+openai>=1.0.0        # client.py: OpenAI, Cerebras and OpenRouter all
+                     # speak this API; only the base URL differs.
+
+# pytest>=7.0.0      # recommended for running tests/, but each test file
+                     # also has a run_all() entry point that works without it.
