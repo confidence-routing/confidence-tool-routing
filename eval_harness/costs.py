@@ -111,16 +111,51 @@ def estimate_cost_usd(
 
 def estimate_record_cost_usd(record) -> float:
     """
-    Convenience wrapper: estimate total USD cost for a TaskRecord, covering
-    both the main-model call and any tool round-trip tokens, plus whatever
-    flat tool_api_cost_usd was logged (e.g. a paid web-search API call).
+    Convenience wrapper: estimate total USD cost for a TaskRecord.
+
+    Three stages, all billed:
+
+      main        the answer itself, at record.model_name
+      tool        the tool round-trip's extra tokens, also at
+                  record.model_name, plus flat tool_api_cost_usd for
+                  non-token charges (e.g. a paid web-search call)
+      confidence  tokens spent ESTIMATING confidence rather than
+                  answering -- self-consistency's k-1 extra samples, the
+                  external verifier's call -- at confidence_model_name
+                  when set, else record.model_name, plus flat
+                  confidence_api_cost_usd
+
+    The confidence stage is billed separately because it is routinely a
+    different model: a verifier is deliberately cheaper than the model it
+    checks. Leaving it out (as this function did before) makes free token
+    entropy and k-sample self-consistency cost exactly the same, which
+    hides the one difference the routing argument depends on.
+
+    Records logged before these fields existed default every one of them
+    to zero, so old runs price exactly as they did before.
     """
     main_cost = estimate_cost_usd(
         record.model_name, record.prompt_tokens, record.completion_tokens
     )
+
     tool_token_cost = 0.0
     if record.tool_prompt_tokens or record.tool_completion_tokens:
         tool_token_cost = estimate_cost_usd(
             record.model_name, record.tool_prompt_tokens, record.tool_completion_tokens
         )
-    return main_cost + tool_token_cost + record.tool_api_cost_usd
+
+    confidence_token_cost = 0.0
+    if record.confidence_prompt_tokens or record.confidence_completion_tokens:
+        confidence_token_cost = estimate_cost_usd(
+            record.confidence_model_name or record.model_name,
+            record.confidence_prompt_tokens,
+            record.confidence_completion_tokens,
+        )
+
+    return (
+        main_cost
+        + tool_token_cost
+        + record.tool_api_cost_usd
+        + confidence_token_cost
+        + record.confidence_api_cost_usd
+    )

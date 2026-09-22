@@ -94,6 +94,20 @@ class TaskRecord:
     tool_completion_tokens: int = 0
     tool_api_cost_usd: float = 0.0    # non-token costs, e.g. a paid search API call
 
+    # Tokens spent ESTIMATING confidence, not answering: self-consistency's
+    # k-1 extra samples, the external verifier's call. Without these the
+    # expensive estimators look as cheap as free token entropy, and CPST
+    # cannot show the cost difference the whole project turns on.
+    confidence_prompt_tokens: int = 0
+    confidence_completion_tokens: int = 0
+    # Verifier calls deliberately use a cheaper model than the main answer,
+    # so the confidence stage needs its own rate. Empty = same as model_name.
+    confidence_model_name: str = ""
+    # Escape hatch for a confidence stage spanning two models (hybrid runs
+    # self-consistency on the main model AND a verifier on a cheap one):
+    # price the odd one out here rather than forcing one rate on both.
+    confidence_api_cost_usd: float = 0.0
+
     # --- latency ---
     latency: LatencyBreakdown = field(default_factory=LatencyBreakdown)
 
@@ -102,11 +116,15 @@ class TaskRecord:
 
     @property
     def total_prompt_tokens(self) -> int:
-        return self.prompt_tokens + self.tool_prompt_tokens
+        return self.prompt_tokens + self.tool_prompt_tokens + self.confidence_prompt_tokens
 
     @property
     def total_completion_tokens(self) -> int:
-        return self.completion_tokens + self.tool_completion_tokens
+        return (
+            self.completion_tokens
+            + self.tool_completion_tokens
+            + self.confidence_completion_tokens
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
