@@ -269,6 +269,33 @@ def test_self_consistency_costs_more_than_entropy():
     print("test_self_consistency_costs_more_than_entropy: PASS")
 
 
+def test_new_log_rows_do_not_crash_old_code():
+    # The mirror of the test above, and the one that actually bit: this
+    # PR adds four fields, so a log written now cannot be read by any
+    # checkout from before it. TaskRecord(**d) raises on an unknown key,
+    # and a published run routinely outlives the code that produced it.
+    row = {"task_id": "t", "dataset": "d", "model_name": "gpt-4o",
+           "prompt_tokens": 1000, "completion_tokens": 100,
+           "a_field_added_later": 42}
+    rec = TaskRecord.from_dict(row)
+    assert rec.task_id == "t"
+    with pricing_age(1):
+        assert abs(estimate_record_cost_usd(rec) - _MAIN_ONLY) < 1e-12
+    print("test_new_log_rows_do_not_crash_old_code: PASS")
+
+
+def test_unknown_fields_are_kept_not_dropped():
+    # Set aside rather than discarded: silently dropping a cost field
+    # would let a replay report a cheaper CPST than the run it came from,
+    # with nothing in the output saying so.
+    row = {"task_id": "t", "dataset": "d", "meta": {"existing": 1},
+           "confidence_prompt_tokens_v2": 500}
+    rec = TaskRecord.from_dict(row)
+    assert rec.meta["existing"] == 1, rec.meta
+    assert rec.meta["_unknown_fields"] == {"confidence_prompt_tokens_v2": 500}, rec.meta
+    print("test_unknown_fields_are_kept_not_dropped: PASS")
+
+
 def run_all():
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     for t in tests:

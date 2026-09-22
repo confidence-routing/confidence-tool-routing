@@ -11,7 +11,7 @@ report.py is computed by aggregating a list of these.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, fields, asdict
 from enum import Enum
 from typing import Optional, Dict, Any
 import time
@@ -138,6 +138,25 @@ class TaskRecord:
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "TaskRecord":
         d = dict(d)
+
+        # Forward compatibility. TaskRecord(**d) raises on any key it does
+        # not know, so before this, code from an older checkout could not
+        # read a log written after a field was added -- and this PR adds
+        # four. Old code reading new logs is the normal case when a
+        # published run outlives the checkout that produced it.
+        #
+        # Unknown keys are set aside rather than dropped: silently
+        # discarding a cost field would let a replay report a different
+        # (cheaper) CPST than the run it came from, with nothing in the
+        # output saying so. Parked in meta, they stay visible to anyone
+        # reading the record.
+        known = {f.name for f in fields(TaskRecord)}
+        unknown = {k: d.pop(k) for k in list(d) if k not in known}
+        if unknown:
+            meta = dict(d.get("meta") or {})
+            meta["_unknown_fields"] = unknown
+            d["meta"] = meta
+
         d["tool_necessity"] = ToolNecessity(d.get("tool_necessity", "not_required"))
         d["routing_decision"] = RoutingDecision(d.get("routing_decision", "direct"))
         d["tool_used"] = ToolType(d.get("tool_used", "none"))
