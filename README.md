@@ -1,10 +1,10 @@
-# Confidence-Based Tool Routing — Eval Harness (Phase 1)
+# Confidence-Based Tool Routing — Eval Harness
 
 Custom evaluation harness for the "Confidence-Based Tool Routing in Agentic
-AI" project. This is Phase 1 of the research execution roadmap (Fig. 2):
-build the measurement infrastructure before the confidence module and tool
-router exist, so every later experiment logs into the same schema from day
-one.
+AI" project. Phase 1 built the measurement infrastructure before the
+confidence module and tool router existed, so every later experiment logs
+into the same schema from day one. Phase 2 added the four confidence
+estimators; Phase 3 adds the router that acts on them.
 
 ## Structure
 
@@ -17,10 +17,16 @@ confidence_routing/
     metrics.py    CPST, ECE (+ grouping), routing precision/recall,
                   unnecessary/missed-call rate, latency breakdown
     report.py     Aggregates records -> summary dict / printable report
+    confidence.py Confidence estimators: token entropy, self-consistency,
+                  external verifier, hybrid combiner
+    router.py     The routing decision + threshold sweep / selection
   examples/
     dummy_run.py  Simulates 240 synthetic tasks end-to-end, no API calls
   tests/
-    test_metrics.py  11 hand-verified unit tests for every metric
+    test_metrics.py     hand-verified unit tests for every metric
+    test_costs.py       pricing table + staleness guard
+    test_confidence.py  all four estimators
+    test_router.py      routing decision, sweep, threshold selection
 ```
 
 ## Quickstart
@@ -58,9 +64,23 @@ python -m pytest tests/ -v        # verify the math
   https://openai.com/api/pricing before trusting CPST numbers in a
   results table.
 
-## Next (Phase 2)
+- **The router owns the cut, not the tool choice.** `route()` answers
+  DIRECT or TOOL from a confidence and a threshold; which tool a TOOL
+  decision calls is the task's category, which the caller knows and the
+  router does not. Missing confidence escalates by default — no evidence
+  of confidence is not evidence of confidence.
+- **Threshold sweeps report routing quality, not CPST.** Precision,
+  recall and the call rates depend only on the necessity label and the
+  decision, so they can be recomputed counterfactually from one run's
+  log. Correctness under a decision the system never took cannot be, so
+  a real CPST curve needs the pipeline run at each threshold.
 
-Wire in the confidence module (token entropy, self-consistency, external
-lightweight verifier) so `TaskRecord.confidence_score` is populated by a
-real signal instead of `dummy_run.py`'s simulated one. The report/metrics
-code needs no changes — it already expects exactly this field.
+## Next (Phase 4)
+
+Everything above is pure: estimators take an already-completed API
+response, the router takes an already-computed confidence. What is still
+missing is the runner that makes the actual calls — query in, TaskRecord
+out — wiring `confidence.py` and `router.py` to a real model and real
+tools. After that, the cascade: entropy on every task, escalate to
+self-consistency or the verifier only near the threshold, which is where
+the cost argument of the project actually gets made.
