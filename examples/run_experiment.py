@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from eval_harness import RunLogger, build_report, print_report
 from eval_harness.client import DEFAULT_PROVIDER, Client, MissingAPIKey
 from eval_harness.confidence import ConfidenceMethod
+from eval_harness.labeling import apply_labels, load_labels
 from eval_harness.models import ToolNecessity
 from eval_harness.runner import RunConfig, run_dataset
 from task_datasets import load_dataset
@@ -66,6 +67,9 @@ def main(argv=None) -> int:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--run-id", default=None)
     p.add_argument("--log-dir", default="runs")
+    p.add_argument("--labels", default=None,
+                   help="tool_necessity labels (default labels/<dataset>.json "
+                        "if present); produced by examples.label_pilot")
     p.add_argument("--probe", action="store_true",
                    help="check the model returns logprobs, then exit")
     args = p.parse_args(argv)
@@ -96,6 +100,27 @@ def main(argv=None) -> int:
         print(f"No tasks loaded for {args.dataset!r}.", file=sys.stderr)
         return 1
 
+    # Labels come from the pilot. Producing them from the model's own
+    # failures and then scoring the router on the same tasks would make
+    # "needed a tool" and "the router escalated" two readings of one
+    # measurement, which is why label_pilot holds half the tasks back.
+    label_path = args.labels or f"labels/{args.dataset}.json"
+    if Path(label_path).exists():
+        label_set = load_labels(label_path)
+        if label_set.get("model") and label_set["model"] != args.model:
+            warnings.warn(
+                f"labels in {label_path} were produced with "
+                f"{label_set['model']!r} but this run uses {args.model!r}. "
+                f"tool_necessity is model-relative, so these labels describe "
+                f"a different model's limits.", UserWarning, stacklevel=1)
+        labelled = apply_labels(tasks, label_set, strict=False)
+        print(f"labels: {sum(1 for t in labelled if t.get('tool_necessity'))}"
+              f"/{len(tasks)} from {label_path}")
+        tasks = labelled
+    elif args.labels:
+        print(f"No label file at {label_path}", file=sys.stderr)
+        return 1
+
     unlabelled = sum(1 for t in tasks if not t.get("tool_necessity"))
     if unlabelled:
         # Not fatal: the cost and calibration numbers are still real. But
@@ -106,7 +131,8 @@ def main(argv=None) -> int:
             f"{unlabelled}/{len(tasks)} tasks have no tool_necessity label, so "
             f"routing precision/recall and the call rates are not meaningful "
             f"for this run. CPST and ECE are unaffected. Label them with a "
-            f"pilot run first.", UserWarning, stacklevel=1)
+            f"pilot run first: python -m examples.label_pilot "
+            f"--dataset {args.dataset}", UserWarning, stacklevel=1)
 
     cfg = RunConfig(
         model=args.model,

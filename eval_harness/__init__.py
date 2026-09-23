@@ -15,6 +15,7 @@ Core pieces:
     - grading.py  Fills in TaskRecord.correct, one grader per dataset
     - client.py   The only module that makes a network call
     - runner.py   The loop: answer, confidence, route, tool, grade, log
+    - labeling.py Produces tool_necessity from a pilot run
     - confidence.py  Confidence estimators: entropy, self-consistency,
                   external verifier, hybrid combiner
     - router.py   The routing decision itself + threshold selection
@@ -39,6 +40,9 @@ from .grading import grade, grade_gsm8k, grade_humaneval
 # Client.__post_init__, so the package stays importable without it.
 from .client import Client, MissingAPIKey
 from .runner import RunConfig, run_task, run_dataset
+from .labeling import (
+    label_tool_necessity, apply_labels, load_labels, save_labels, split_tasks,
+)
 
 __all__ = [
     "TaskRecord",
@@ -68,4 +72,9 @@ __all__ = [
     "RunConfig",
     "run_task",
     "run_dataset",
+    "label_tool_necessity",
+    "apply_labels",
+    "load_labels",
+    "save_labels",
+    "split_tasks",
 ]
