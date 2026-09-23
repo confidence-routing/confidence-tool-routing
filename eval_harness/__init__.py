@@ -11,6 +11,8 @@ Core pieces:
     - metrics.py  CPST, ECE (per-tool + aggregate), routing precision/recall,
                   unnecessary/missed tool-call rate, latency breakdown
     - report.py   Turns a run's records into a summary dict / printable report
+    - tools.py    What a TOOL decision calls: calculator, Python runner
+    - grading.py  Fills in TaskRecord.correct, one grader per dataset
     - confidence.py  Confidence estimators: entropy, self-consistency,
                   external verifier, hybrid combiner
     - router.py   The routing decision itself + threshold selection
@@ -29,6 +31,8 @@ from .metrics import (
 )
 from .report import build_report, print_report
 from .router import route, route_record, sweep_thresholds, select_threshold
+from .tools import calculate, run_python
+from .grading import grade, grade_gsm8k, grade_humaneval
 
 __all__ = [
     "TaskRecord",
@@ -48,4 +52,9 @@ __all__ = [
     "route_record",
     "sweep_thresholds",
     "select_threshold",
+    "calculate",
+    "run_python",
+    "grade",
+    "grade_gsm8k",
+    "grade_humaneval",
 ]
