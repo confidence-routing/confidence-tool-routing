@@ -7,13 +7,22 @@ both grade themselves without a human or a judge model in the loop:
 
     gsm8k      final number matches the gold number
     humaneval  the code passes the test suite the dataset ships with
+    coqa       token-overlap F1 against the reference answer
 
 Automatic grading is why these two datasets were picked for the shipping
 scope. A grader that needs an LLM to judge correctness would put a second
 unvalidated model inside the metric the whole experiment reports, which
 is a problem you cannot argue your way out of in a results table.
 
-Answer normalization is NOT reimplemented here. ``confidence.py`` already
+CoQA is the one exception to reusing confidence.py's normalization, and
+the exception is deliberate. Its published numbers are SQuAD-style token
+F1, which normalizes by stripping articles and punctuation before
+comparing bags of tokens -- a convention, not a better idea. Deviating
+from it would make the results incomparable to every other CoQA number
+in the literature, which is a worse outcome than having two normalizers.
+The other datasets have no such convention, so they still share one.
+
+Answer normalization is otherwise NOT reimplemented here. ``confidence.py`` already
 canonicalizes free-text answers for vote bucketing -- case, whitespace,
 answer prefixes, "$1,234.00" == "1234" -- and grading needs the same
 rules. Two different notions of "same answer" in one codebase is how you
@@ -25,7 +34,8 @@ final number out of a sentence, which vote bucketing never needed.
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Optional
+from collections import Counter
+from typing import Any, Dict, List, Optional
 
 from .confidence import normalize_answer
 from .tools import run_python
@@ -122,6 +132,73 @@ def grade_humaneval(completion: str, meta: Dict[str, Any], timeout: float = 10.0
     return run_python(program, timeout=timeout).ok
 
 
+# ---------------------------------------------------------------------------
+# CoQA -- token-overlap F1
+# ---------------------------------------------------------------------------
+
+_ARTICLES = {"a", "an", "the"}
+
+
+def _normalize_qa(text: Any) -> List[str]:
+    """
+    SQuAD/CoQA normalization, in that order: casefold, DELETE punctuation,
+    drop articles, split on whitespace.
+
+    Deleting punctuation rather than replacing it with a space is the
+    detail that matters, and it is the published convention:
+    "down-stream" has to normalize to one token, "downstream", or it
+    scores 0 against it. Spacing the hyphen instead gives two tokens and
+    no overlap at all -- the model is marked wrong for hyphenating.
+    """
+    if text is None:
+        return []
+    if not isinstance(text, str):
+        text = str(text)
+    stripped = "".join(ch for ch in text.lower() if ch.isalnum() or ch.isspace())
+    return [t for t in stripped.split() if t not in _ARTICLES]
+
+
+def token_f1(prediction: Any, reference: Any) -> float:
+    """
+    Token-overlap F1 in [0, 1], the standard CoQA metric.
+
+    Free-text answers do not admit exact match: "down-stream", "he went
+    down-stream" and "downstream" are the same answer, and grading them
+    as three would understate every model equally but make the numbers
+    meaningless. F1 over token bags is the convention that handles it.
+
+    Yes/no answers are the known weak spot -- a single token means F1 is
+    all-or-nothing there -- which is a property of the metric, not of
+    this implementation, and it is what published CoQA numbers use.
+    """
+    pred, ref = _normalize_qa(prediction), _normalize_qa(reference)
+    if not pred or not ref:
+        # Both empty is a match; one empty is not.
+        return float(pred == ref)
+
+    common = Counter(pred) & Counter(ref)
+    overlap = sum(common.values())
+    if overlap == 0:
+        return 0.0
+
+    precision = overlap / len(pred)
+    recall = overlap / len(ref)
+    return 2 * precision * recall / (precision + recall)
+
+
+# TaskRecord.correct is a bool, so the continuous F1 has to be cut
+# somewhere. 0.5 is the conventional "substantially right" line. The raw
+# score is kept in the record's meta by the runner, so a different cut
+# can be applied afterwards without re-running anything.
+COQA_F1_THRESHOLD = 0.5
+
+
+def grade_coqa(model_answer: Any, gold_answer: Any,
+               threshold: float = COQA_F1_THRESHOLD) -> bool:
+    """True if the answer's token-overlap F1 clears ``threshold``."""
+    return token_f1(model_answer, gold_answer) >= threshold
+
+
 def grade(dataset: str, model_answer: Any, gold_answer: Any = None,
           meta: Optional[Dict[str, Any]] = None) -> bool:
     """Dispatch to the right grader. Unknown dataset is a hard error --
@@ -130,4 +207,6 @@ def grade(dataset: str, model_answer: Any, gold_answer: Any = None,
         return grade_gsm8k(model_answer, gold_answer)
     if dataset == "humaneval":
         return grade_humaneval(model_answer, meta or {})
+    if dataset == "coqa":
+        return grade_coqa(model_answer, gold_answer)
     raise KeyError(f"No grader for dataset '{dataset}'. Add one in grading.py.")

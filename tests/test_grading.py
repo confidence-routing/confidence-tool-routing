@@ -22,6 +22,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from eval_harness.grading import (
     build_humaneval_program,
+    grade_coqa,
+    token_f1,
     extract_final_number,
     grade,
     grade_gsm8k,
@@ -179,6 +181,63 @@ def test_unknown_dataset_raises():
         print("test_unknown_dataset_raises: PASS")
         return
     raise AssertionError("expected KeyError for an unknown dataset")
+
+
+# ---------------------------------------------------------------------------
+# CoQA -- token-overlap F1
+# ---------------------------------------------------------------------------
+
+def test_identical_answers_score_one():
+    assert token_f1("down-stream", "down-stream") == 1.0
+    print("test_identical_answers_score_one: PASS")
+
+
+def test_punctuation_is_deleted_not_spaced():
+    # The detail that makes this match published CoQA numbers. Deleting
+    # the hyphen gives one token, "downstream", which matches. Replacing
+    # it with a space gives two tokens and zero overlap -- the model
+    # marked wrong purely for hyphenating.
+    assert token_f1("downstream", "down-stream") == 1.0
+    print("test_punctuation_is_deleted_not_spaced: PASS")
+
+
+def test_articles_are_ignored():
+    assert token_f1("the dog", "a dog") == 1.0
+    print("test_articles_are_ignored: PASS")
+
+
+def test_partial_overlap_scores_between():
+    # pred={he,went,downstream} ref={downstream}
+    #   precision 1/3, recall 1/1 -> f1 = 2*(1/3)/(1/3+1) = 0.5
+    assert abs(token_f1("he went down-stream", "down-stream") - 0.5) < 1e-9
+    print("test_partial_overlap_scores_between: PASS")
+
+
+def test_no_overlap_scores_zero():
+    assert token_f1("upstream", "down-stream") == 0.0
+    print("test_no_overlap_scores_zero: PASS")
+
+
+def test_empty_prediction_scores_zero_against_a_real_answer():
+    assert token_f1("", "down-stream") == 0.0
+    assert token_f1(None, "down-stream") == 0.0
+    # both empty is a match, not a failure
+    assert token_f1("", "") == 1.0
+    print("test_empty_prediction_scores_zero_against_a_real_answer: PASS")
+
+
+def test_grade_coqa_cuts_at_the_threshold():
+    # 0.5 exactly must pass: the cut is >=, and half-overlap answers like
+    # "he went down-stream" land precisely there rather than near it.
+    assert grade_coqa("he went down-stream", "down-stream") is True
+    assert grade_coqa("upstream", "down-stream") is False
+    assert grade_coqa("he went somewhere down-stream today", "down-stream") is False
+    print("test_grade_coqa_cuts_at_the_threshold: PASS")
+
+
+def test_grade_dispatches_coqa():
+    assert grade("coqa", "Joe Ladue.", "joe ladue") is True
+    print("test_grade_dispatches_coqa: PASS")
 
 
 def run_all():

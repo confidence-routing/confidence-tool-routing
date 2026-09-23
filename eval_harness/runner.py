@@ -40,7 +40,7 @@ from .confidence import (
     estimate_self_consistency_confidence,
 )
 from .costs import PRICING_TABLE, estimate_cost_usd
-from .grading import grade
+from .grading import grade, token_f1
 from .models import (
     LatencyBreakdown,
     RoutingDecision,
@@ -52,17 +52,57 @@ from .router import route
 from .tools import calculate, run_python
 
 # Which tool each dataset's TOOL branch reaches for.
-DATASET_TOOL = {"gsm8k": ToolType.CALCULATOR, "humaneval": ToolType.CODE_EXECUTOR}
+DATASET_TOOL = {"gsm8k": ToolType.CALCULATOR,
+                "humaneval": ToolType.CODE_EXECUTOR,
+                "coqa": ToolType.RETRIEVAL}
 
 _ANSWER_SYSTEM = (
     "Answer the question. Be brief. State your final answer on the last "
     "line, with no explanation after it."
+)
+_COQA_SYSTEM = (
+    "Answer the question in as few words as possible, using the wording of "
+    "the source where you can. Do not explain."
 )
 _EXPRESSION_SYSTEM = (
     "Rewrite the arithmetic needed to answer this question as ONE Python "
     "expression using only numbers and + - * / ( ). Output the expression "
     "alone, nothing else."
 )
+
+
+def build_messages(task: Dict[str, Any], *, include_passage: bool = False) -> List[Dict[str, str]]:
+    """
+    The prompt for one task. ``include_passage`` is the retrieval tool.
+
+    For CoQA this is not cosmetic. Its questions are conversational --
+    "Where did Harper go?" is unanswerable without the turns before it --
+    so the history goes in on BOTH paths. What the tool adds is the
+    passage, and only the passage, which is what makes the direct/tool
+    comparison a test of retrieval rather than a test of whether the
+    model was told what the conversation was about.
+
+    Every caller goes through here for the same reason: if the
+    self-consistency samples saw a different prompt than the answer they
+    are meant to be resampling, the agreement rate would be measuring
+    two different questions.
+    """
+    dataset = task.get("dataset", "")
+    meta = task.get("meta", {}) or {}
+
+    if dataset != "coqa":
+        return [{"role": "system", "content": _ANSWER_SYSTEM},
+                {"role": "user", "content": task["query"]}]
+
+    messages = [{"role": "system", "content": _COQA_SYSTEM}]
+    if include_passage and meta.get("passage"):
+        messages.append({"role": "user",
+                         "content": f"Passage:\n\n{meta['passage']}"})
+    for turn in meta.get("conversation_history") or []:
+        messages.append({"role": "user", "content": turn.get("question", "")})
+        messages.append({"role": "assistant", "content": turn.get("answer", "")})
+    messages.append({"role": "user", "content": task["query"]})
+    return messages
 
 
 @dataclass
@@ -130,8 +170,7 @@ def estimate_confidence(
     the verifier is a deliberately cheaper one, and pricing both at one
     rate would misreport whichever is not that model.
     """
-    messages = [{"role": "system", "content": _ANSWER_SYSTEM},
-                {"role": "user", "content": task["query"]}]
+    messages = build_messages(task)
 
     signals: Dict[Any, Any] = {}
     main_cost, verifier_cost = _Cost(), _Cost()
@@ -234,6 +273,24 @@ def apply_tool(
         return {"answer": _text(retry) or answer_text, "cost": cost,
                 "tool_used": ToolType.CODE_EXECUTOR, "tool_helped": True}
 
+    if dataset == "coqa":
+        # Retrieval: re-ask with the passage in front of the same
+        # conversation. The passage IS the retrieved document, so the
+        # tool's cost is the extra prompt tokens it adds -- which is the
+        # honest price of retrieval, and the reason this tool is not free
+        # the way the calculator is.
+        if not (task.get("meta") or {}).get("passage"):
+            return {"answer": answer_text, "cost": cost,
+                    "tool_used": ToolType.RETRIEVAL, "tool_helped": False}
+        response = client.complete(
+            build_messages(task, include_passage=True),
+            cfg.model, max_tokens=cfg.max_tokens, temperature=0.0,
+        )
+        cost.add(response)
+        grounded = _text(response)
+        return {"answer": grounded or answer_text, "cost": cost,
+                "tool_used": ToolType.RETRIEVAL, "tool_helped": bool(grounded)}
+
     raise KeyError(f"No tool wired for dataset {dataset!r}. Add one in runner.py.")
 
 
@@ -244,8 +301,7 @@ def apply_tool(
 def run_task(client: Any, task: Dict[str, Any], cfg: RunConfig) -> TaskRecord:
     """Answer, estimate, route, maybe use a tool, grade, and return the row."""
     dataset = task.get("dataset", "")
-    messages = [{"role": "system", "content": _ANSWER_SYSTEM},
-                {"role": "user", "content": task["query"]}]
+    messages = build_messages(task)
 
     t0 = time.perf_counter()
     answer_response = client.complete(
@@ -274,6 +330,11 @@ def run_task(client: Any, task: Dict[str, Any], cfg: RunConfig) -> TaskRecord:
     correct = grade(dataset, final_answer,
                     gold_answer=task.get("gold_answer"),
                     meta=task.get("meta"))
+
+    # CoQA's real metric is continuous; TaskRecord.correct is a bool. Keep
+    # the raw F1 so a different cut can be applied later without paying
+    # for the run again.
+    coqa_f1 = token_f1(final_answer, task.get("gold_answer")) if dataset == "coqa" else None
 
     # The confidence stage can span two models: self-consistency resamples
     # the main one, the verifier is a cheaper one. The token fields carry
@@ -328,6 +389,7 @@ def run_task(client: Any, task: Dict[str, Any], cfg: RunConfig) -> TaskRecord:
             "verifier_prompt_tokens": conf["verifier"].prompt,
             "verifier_completion_tokens": conf["verifier"].completion,
             "task_tool_category": task.get("tool_type", "none"),
+            "coqa_f1": coqa_f1,
         },
     )
 

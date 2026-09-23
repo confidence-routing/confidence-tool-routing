@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from eval_harness.confidence import ConfidenceMethod
 from eval_harness.models import RoutingDecision, ToolType
-from eval_harness.runner import RunConfig, run_dataset, run_task
+from eval_harness.runner import RunConfig, build_messages, run_dataset, run_task
 
 # log(1.0) ~ 0 -> one candidate carries all the mass -> confident
 CONFIDENT = [{"token": "5", "logprob": -0.0001},
@@ -289,6 +289,85 @@ def test_package_imports_without_the_openai_sdk():
         importlib.reload(importlib.import_module("eval_harness.client"))
         importlib.reload(importlib.import_module("eval_harness"))
     print("test_package_imports_without_the_openai_sdk: PASS")
+
+
+# ---------------------------------------------------------------------------
+# CoQA: retrieval is the tool, and it is the ONLY difference between paths
+# ---------------------------------------------------------------------------
+
+COQA = {"task_id": "c1", "dataset": "coqa", "query": "Where did Harper go?",
+        "gold_answer": "down-stream", "tool_necessity": "required",
+        "tool_type": "retrieval",
+        "meta": {"passage": "Harper left down-stream that morning.",
+                 "conversation_history": [
+                     {"question": "Who advised Daylight?", "answer": "Joe Ladue"}]}}
+
+
+def test_history_is_on_both_paths_passage_only_on_the_tool_path():
+    # CoQA questions are conversational -- "Where did Harper go?" is
+    # unanswerable without the prior turns. If the history only appeared
+    # on the tool path, the comparison would measure whether the model
+    # was told what the conversation was about, not whether retrieval
+    # helped.
+    direct = build_messages(COQA)
+    tooled = build_messages(COQA, include_passage=True)
+    for messages in (direct, tooled):
+        assert any("Joe Ladue" in m["content"] for m in messages)
+    assert not any("Passage:" in m["content"] for m in direct)
+    assert any("Passage:" in m["content"] for m in tooled)
+    print("test_history_is_on_both_paths_passage_only_on_the_tool_path: PASS")
+
+
+def test_unsure_coqa_answer_retrieves_the_passage():
+    class CoqaStub(StubClient):
+        def complete(self, messages, model, **kw):
+            saw_passage = any("Passage:" in m["content"] for m in messages)
+            self.calls.append({"saw_passage": saw_passage})
+            text = "down-stream" if saw_passage else "upstream"
+            return response(text, top=None if saw_passage else UNSURE)
+
+    client = CoqaStub()
+    rec = run_task(client, COQA, RunConfig())
+    assert rec.routing_decision == RoutingDecision.TOOL
+    assert rec.tool_used == ToolType.RETRIEVAL
+    assert rec.model_answer == "down-stream"
+    assert rec.correct is True
+    assert any(c.get("saw_passage") for c in client.calls)
+    print("test_unsure_coqa_answer_retrieves_the_passage: PASS")
+
+
+def test_confident_coqa_answer_never_sees_the_passage():
+    client = StubClient(answer="down-stream", top=CONFIDENT)
+    rec = run_task(client, COQA, RunConfig())
+    assert rec.routing_decision == RoutingDecision.DIRECT
+    assert rec.correct is True
+    print("test_confident_coqa_answer_never_sees_the_passage: PASS")
+
+
+def test_coqa_keeps_the_continuous_f1_in_meta():
+    # correct is a bool, but CoQA's real metric is continuous. Keeping
+    # the raw score means a different cut can be applied later without
+    # paying for the run again.
+    rec = run_task(StubClient(answer="he went down-stream", top=CONFIDENT),
+                   COQA, RunConfig())
+    assert rec.meta["coqa_f1"] is not None
+    assert abs(rec.meta["coqa_f1"] - 0.5) < 1e-9, rec.meta["coqa_f1"]
+    print("test_coqa_keeps_the_continuous_f1_in_meta: PASS")
+
+
+def test_retrieval_tool_cost_is_the_passage_tokens():
+    class CoqaStub(StubClient):
+        def complete(self, messages, model, **kw):
+            if any("Passage:" in m["content"] for m in messages):
+                return response("down-stream", prompt=900, completion=12)
+            return response("upstream", top=UNSURE, prompt=100, completion=10)
+
+    rec = run_task(CoqaStub(), COQA, RunConfig())
+    # Retrieval is not free the way the calculator is: the passage is
+    # extra prompt tokens, and that is the honest price of the tool.
+    assert rec.tool_prompt_tokens == 900, rec.tool_prompt_tokens
+    assert rec.tool_completion_tokens == 12
+    print("test_retrieval_tool_cost_is_the_passage_tokens: PASS")
 
 
 def run_all():
