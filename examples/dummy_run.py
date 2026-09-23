@@ -6,7 +6,7 @@ Simulates a small batch of tasks across the four tool categories, logs
 them through RunLogger, then reloads the log from disk and builds a full
 report. This exists to prove the harness works end-to-end before any real
 model calls are wired in — run it first, get a report, THEN plug in the
-confidence module and tool router from Phase 2.
+confidence module (Phase 2) and tool router (Phase 3).
 
 Run:
     python -m examples.dummy_run          (from the project root)
@@ -14,6 +14,7 @@ Run:
 
 from __future__ import annotations
 
+import datetime
 import random
 import sys
 from pathlib import Path
@@ -106,7 +107,13 @@ def simulate_task(task_id: int, tool_category: ToolType) -> TaskRecord:
 
 
 def main() -> None:
-    logger = RunLogger(run_id="dummy_run_001", log_dir="runs")
+    # A fresh run_id per invocation, which is the pattern a real run
+    # wants too. With a fixed one, re-running appends to the previous
+    # log and the report below -- which reloads the whole file -- covers
+    # every run ever made under that id. It reads as a working example
+    # right up until the task count quietly stops matching reality.
+    run_id = f"dummy_run_{datetime.datetime.now():%Y%m%d_%H%M%S_%f}"
+    logger = RunLogger(run_id=run_id, log_dir="runs")
 
     tool_categories = list(DATASETS_BY_TOOL.keys())
     n_per_category = 60
