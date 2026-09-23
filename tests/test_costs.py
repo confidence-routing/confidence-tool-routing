@@ -269,11 +269,13 @@ def test_self_consistency_costs_more_than_entropy():
     print("test_self_consistency_costs_more_than_entropy: PASS")
 
 
-def test_new_log_rows_do_not_crash_old_code():
-    # The mirror of the test above, and the one that actually bit: this
-    # PR adds four fields, so a log written now cannot be read by any
-    # checkout from before it. TaskRecord(**d) raises on an unknown key,
-    # and a published run routinely outlives the code that produced it.
+def test_reader_tolerates_fields_added_later():
+    # THIS reader, reading a row from a future schema. Named carefully:
+    # it does not show that an older checkout can read a log written now,
+    # because it cannot. Older code runs its own from_dict without this
+    # filter and still raises -- see the note in models.from_dict. What
+    # is fixed is this version onward, so the NEXT field added does not
+    # break every reader shipped in between.
     row = {"task_id": "t", "dataset": "d", "model_name": "gpt-4o",
            "prompt_tokens": 1000, "completion_tokens": 100,
            "a_field_added_later": 42}
@@ -281,7 +283,7 @@ def test_new_log_rows_do_not_crash_old_code():
     assert rec.task_id == "t"
     with pricing_age(1):
         assert abs(estimate_record_cost_usd(rec) - _MAIN_ONLY) < 1e-12
-    print("test_new_log_rows_do_not_crash_old_code: PASS")
+    print("test_reader_tolerates_fields_added_later: PASS")
 
 
 def test_unknown_fields_are_kept_not_dropped():

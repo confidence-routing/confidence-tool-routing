@@ -139,11 +139,15 @@ class TaskRecord:
     def from_dict(d: Dict[str, Any]) -> "TaskRecord":
         d = dict(d)
 
-        # Forward compatibility. TaskRecord(**d) raises on any key it does
-        # not know, so before this, code from an older checkout could not
-        # read a log written after a field was added -- and this PR adds
-        # four. Old code reading new logs is the normal case when a
-        # published run outlives the checkout that produced it.
+        # Forward compatibility OF THIS READER, and only of this reader.
+        # TaskRecord(**d) raises on any key it does not know, so from here
+        # on a field added later will not break this version.
+        #
+        # What it explicitly does NOT do is let an OLDER checkout read a
+        # log written now: that code runs its own from_dict, without this
+        # filter, and still raises on the confidence_* fields this change
+        # adds. A fix cannot reach a reader it does not ship. Anyone
+        # replaying a new log on an old checkout has to update first.
         #
         # Unknown keys are set aside rather than dropped: silently
         # discarding a cost field would let a replay report a different
