@@ -258,6 +258,39 @@ def test_rows_are_logged_as_they_complete():
     print("test_rows_are_logged_as_they_complete: PASS")
 
 
+def test_package_imports_without_the_openai_sdk():
+    # The harness is stdlib-only except for the one module that makes a
+    # network call, and client.py keeps it that way by importing openai
+    # lazily inside Client.__post_init__. Moving that import to module
+    # level would break every stdlib-only path -- including this whole
+    # test suite, which never makes a call -- so it is pinned here.
+    import builtins
+    import importlib
+    real_import = builtins.__import__
+
+    def blocked(name, *a, **k):
+        if name == "openai" or name.startswith("openai."):
+            raise ImportError("simulated: openai not installed")
+        return real_import(name, *a, **k)
+
+    builtins.__import__ = blocked
+    try:
+        for name in ("eval_harness.client", "eval_harness.runner", "eval_harness"):
+            importlib.reload(importlib.import_module(name))
+        from eval_harness.client import Client, MissingAPIKey
+        try:
+            Client(provider="cerebras", api_key="x")
+        except ImportError as exc:
+            assert "pip install" in str(exc), exc
+        else:
+            raise AssertionError("expected an ImportError naming the fix")
+    finally:
+        builtins.__import__ = real_import
+        importlib.reload(importlib.import_module("eval_harness.client"))
+        importlib.reload(importlib.import_module("eval_harness"))
+    print("test_package_imports_without_the_openai_sdk: PASS")
+
+
 def run_all():
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     for t in tests:

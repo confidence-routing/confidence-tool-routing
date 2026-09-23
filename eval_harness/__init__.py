@@ -13,6 +13,8 @@ Core pieces:
     - report.py   Turns a run's records into a summary dict / printable report
     - tools.py    What a TOOL decision calls: calculator, Python runner
     - grading.py  Fills in TaskRecord.correct, one grader per dataset
+    - client.py   The only module that makes a network call
+    - runner.py   The loop: answer, confidence, route, tool, grade, log
     - confidence.py  Confidence estimators: entropy, self-consistency,
                   external verifier, hybrid combiner
     - router.py   The routing decision itself + threshold selection
@@ -33,6 +35,10 @@ from .report import build_report, print_report
 from .router import route, route_record, sweep_thresholds, select_threshold
 from .tools import calculate, run_python
 from .grading import grade, grade_gsm8k, grade_humaneval
+# Safe at package level: client.py imports 'openai' lazily, inside
+# Client.__post_init__, so the package stays importable without it.
+from .client import Client, MissingAPIKey
+from .runner import RunConfig, run_task, run_dataset
 
 __all__ = [
     "TaskRecord",
@@ -57,4 +63,9 @@ __all__ = [
     "grade",
     "grade_gsm8k",
     "grade_humaneval",
+    "Client",
+    "MissingAPIKey",
+    "RunConfig",
+    "run_task",
+    "run_dataset",
 ]
