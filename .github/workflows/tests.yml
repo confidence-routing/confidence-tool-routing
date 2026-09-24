@@ -20,11 +20,10 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      # The harness is stdlib-only by design (see requirements.txt), so
-      # pytest is the single install. Nothing else should appear here
-      # until a phase actually needs a dependency at runtime.
-      - name: Install pytest
-        run: python -m pip install --upgrade pip pytest
+      # pytest is installed separately from runtime dependencies so it
+      # remains a development-only dependency.
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip -r requirements.txt pytest
 
       - name: Run test suite
         run: python -m pytest tests/ -v

@@ -32,10 +32,36 @@ confidence_routing/
 ## Quickstart
 
 ```bash
-pip install -r requirements.txt   # currently empty — stdlib only so far
+pip install -r requirements.txt
 python -m examples.dummy_run      # simulate + report, no API key needed
 python -m pytest tests/ -v        # verify the math
 ```
+
+## Cerebras LLM support
+
+The optional model-call layer uses the official Cerebras SDK. Set the API
+key only in your environment, never in source control:
+
+```bash
+export CEREBRAS_API_KEY="your-key"  # PowerShell: $env:CEREBRAS_API_KEY="your-key"
+```
+
+Choose the model when constructing the client, so generator and verifier
+clients can use different configured model names:
+
+```python
+import os
+
+from eval_harness.llm import CerebrasClient
+
+generator = CerebrasClient(model=os.environ["CEREBRAS_SMALL_MODEL"])
+verifier = CerebrasClient(model=os.environ["CEREBRAS_LARGE_MODEL"])
+answer = generator.generate("Explain confidence-based routing.")
+```
+
+`CerebrasClient` is isolated behind the small `LLM` protocol; the router
+remains provider-independent. The client makes requests only when
+`generate()` is called.
 
 ## Design notes
 

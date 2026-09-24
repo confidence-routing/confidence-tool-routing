@@ -1,4 +1,6 @@
-# Phase 1 (eval harness) uses only the Python standard library.
+# The eval harness uses the standard library except for provider integrations.
+cerebras_cloud_sdk
+
 # Uncomment/add as later phases need them:
 
 # openai>=1.0.0          # Phase 2: main LLM + external verifier calls
