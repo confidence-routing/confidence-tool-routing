@@ -104,6 +104,16 @@ PROVIDERS: Dict[str, Dict[str, str]] = {
                    "env": "CEREBRAS_API_KEY"},
     "openrouter": {"base_url": "https://openrouter.ai/api/v1",
                    "env": "OPENROUTER_API_KEY"},
+    # Local inference, OpenAI-compatible. Ollama DOES return logprobs and
+    # top_logprobs despite its compatibility doc not listing them -- checked
+    # against 0.34.4, and the response shape is exactly what
+    # confidence.py's extract_token_logprobs() expects.
+    #
+    # No key is needed, so the env var is a placeholder the SDK accepts;
+    # _needs_key marks the provider as keyless rather than special-casing
+    # the constructor.
+    "ollama":     {"base_url": "http://localhost:11434/v1",
+                   "env": "OLLAMA_API_KEY", "needs_key": "no"},
 }
 
 DEFAULT_PROVIDER = "cerebras"
@@ -152,6 +162,10 @@ class Client:
         if not key and not _dotenv_loaded:
             load_dotenv()
             key = os.environ.get(spec["env"])
+        if not key and spec.get("needs_key") == "no":
+            # A local server authenticates nothing; the SDK still wants a
+            # non-empty string.
+            key = "local"
         if not key:
             raise MissingAPIKey(
                 f"No API key for provider {self.provider!r}. "

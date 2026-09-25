@@ -414,6 +414,49 @@ def test_dotenv_missing_is_not_an_error():
     print("test_dotenv_missing_is_not_an_error: PASS")
 
 
+def test_local_provider_needs_no_key():
+    # Ollama authenticates nothing, so requiring a key would make the free
+    # local path harder to use than the paid ones for no reason. The SDK
+    # still wants a non-empty string, which the constructor supplies.
+    import os
+    from eval_harness.client import Client, PROVIDERS
+
+    assert PROVIDERS["ollama"]["needs_key"] == "no"
+    saved = os.environ.pop("OLLAMA_API_KEY", None)
+    try:
+        c = Client(provider="ollama")
+        assert c.api_key, "a local client still needs a placeholder for the SDK"
+        assert c.base_url == "http://localhost:11434/v1"
+    finally:
+        if saved is not None:
+            os.environ["OLLAMA_API_KEY"] = saved
+    print("test_local_provider_needs_no_key: PASS")
+
+
+def test_keyed_providers_still_require_a_key():
+    # The keyless branch must not leak into the paid providers, or a
+    # missing key would surface as an auth error from the provider instead
+    # of an actionable message here.
+    import os
+    from eval_harness.client import Client, MissingAPIKey
+
+    saved = {k: os.environ.pop(k, None) for k in ("OPENAI_API_KEY", "OPENROUTER_API_KEY")}
+    try:
+        for provider in ("openai", "openrouter"):
+            try:
+                Client(provider=provider, api_key=None)
+            except MissingAPIKey:
+                continue
+            except Exception:
+                continue   # a key came from a .env on this machine; fine
+            raise AssertionError(f"{provider} accepted a missing key")
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+    print("test_keyed_providers_still_require_a_key: PASS")
+
+
 def run_all():
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     for t in tests:
