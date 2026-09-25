@@ -22,6 +22,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from eval_harness.grading import (
     build_humaneval_program,
+    extract_verdict,
+    grade_binary,
+    grade_category,
+    grade_coqa,
+    token_f1,
     extract_final_number,
     grade,
     grade_gsm8k,
@@ -179,6 +184,136 @@ def test_unknown_dataset_raises():
         print("test_unknown_dataset_raises: PASS")
         return
     raise AssertionError("expected KeyError for an unknown dataset")
+
+
+# ---------------------------------------------------------------------------
+# CoQA -- token-overlap F1
+# ---------------------------------------------------------------------------
+
+def test_identical_answers_score_one():
+    assert token_f1("down-stream", "down-stream") == 1.0
+    print("test_identical_answers_score_one: PASS")
+
+
+def test_punctuation_is_deleted_not_spaced():
+    # The detail that makes this comparable to published CoQA numbers.
+    # Deleting the hyphen gives one token, "downstream", which matches.
+    # Spacing it gives two tokens and zero overlap -- the model marked
+    # wrong purely for hyphenating.
+    assert token_f1("downstream", "down-stream") == 1.0
+    print("test_punctuation_is_deleted_not_spaced: PASS")
+
+
+def test_articles_are_ignored():
+    assert token_f1("the dog", "a dog") == 1.0
+    print("test_articles_are_ignored: PASS")
+
+
+def test_partial_overlap_scores_between():
+    # pred={he,went,downstream} ref={downstream}
+    #   precision 1/3, recall 1 -> f1 = 2*(1/3)/(1/3+1) = 0.5
+    assert abs(token_f1("he went down-stream", "down-stream") - 0.5) < 1e-9
+    print("test_partial_overlap_scores_between: PASS")
+
+
+def test_no_overlap_scores_zero():
+    assert token_f1("upstream", "down-stream") == 0.0
+    print("test_no_overlap_scores_zero: PASS")
+
+
+def test_empty_prediction_scores_zero_against_a_real_answer():
+    assert token_f1("", "down-stream") == 0.0
+    assert token_f1(None, "down-stream") == 0.0
+    assert token_f1("", "") == 1.0      # both empty is a match
+    print("test_empty_prediction_scores_zero_against_a_real_answer: PASS")
+
+
+def test_grade_coqa_cuts_at_the_threshold():
+    assert grade_coqa("he went down-stream", "down-stream") is True   # 0.5, cut is >=
+    assert grade_coqa("upstream", "down-stream") is False
+    assert grade_coqa("he went somewhere down-stream today", "down-stream") is False
+    print("test_grade_coqa_cuts_at_the_threshold: PASS")
+
+
+# ---------------------------------------------------------------------------
+# Overruling -- binary Yes/No
+# ---------------------------------------------------------------------------
+
+def test_verdict_takes_the_first_token_not_the_last():
+    # A model asked a yes/no question answers it and then justifies. The
+    # justification contains verdict-like words, so taking the last match
+    # would grade the reasoning instead of the answer.
+    assert extract_verdict("Yes. The sentence is incorrect about the earlier rule.") == "yes"
+    assert extract_verdict("No, though the holding is correct on other grounds.") == "no"
+    print("test_verdict_takes_the_first_token_not_the_last: PASS")
+
+
+def test_verdict_is_case_and_punctuation_insensitive():
+    for text in ("YES", "yes.", "Yes,", "y"):
+        assert extract_verdict(text) == "yes", text
+    print("test_verdict_is_case_and_punctuation_insensitive: PASS")
+
+
+def test_a_reply_with_no_verdict_is_not_a_no():
+    # Defaulting to "no" would credit the model for every negative case
+    # it dodged.
+    assert extract_verdict("It depends on the jurisdiction.") is None
+    assert grade_binary("It depends on the jurisdiction.", "No") is False
+    print("test_a_reply_with_no_verdict_is_not_a_no: PASS")
+
+
+def test_grade_binary_matches_and_mismatches():
+    assert grade_binary("Yes. It rejects the earlier holding.", "Yes") is True
+    assert grade_binary("No, it does not.", "Yes") is False
+    assert grade_binary("no", "No") is True
+    print("test_grade_binary_matches_and_mismatches: PASS")
+
+
+# ---------------------------------------------------------------------------
+# Headlines -- category label
+# ---------------------------------------------------------------------------
+
+def test_category_ignores_punctuation_and_case():
+    assert grade_category("us news", "U.S. NEWS") is True
+    print("test_category_ignores_punctuation_and_case: PASS")
+
+
+def test_category_accepts_a_label_wrapped_in_prose():
+    # A classifier prompt does not reliably suppress prose.
+    assert grade_category("The category is U.S. NEWS.", "U.S. NEWS") is True
+    print("test_category_accepts_a_label_wrapped_in_prose: PASS")
+
+
+def test_categories_sharing_a_word_do_not_cross_match():
+    # U.S. NEWS, WORLD NEWS and WEIRD NEWS all contain "news". Matching
+    # on individual words would count any of them as any other.
+    assert grade_category("WORLD NEWS", "U.S. NEWS") is False
+    assert grade_category("WEIRD NEWS", "WORLD NEWS") is False
+    print("test_categories_sharing_a_word_do_not_cross_match: PASS")
+
+
+def test_empty_category_is_never_correct():
+    assert grade_category("", "COMEDY") is False
+    assert grade_category("COMEDY", "") is False
+    assert grade_category(None, "COMEDY") is False
+    print("test_empty_category_is_never_correct: PASS")
+
+
+# ---------------------------------------------------------------------------
+# Dispatch covers every dataset in the pipeline
+# ---------------------------------------------------------------------------
+
+def test_every_dataset_has_a_grader():
+    # If a dataset reaches the runner without one, grade() raises rather
+    # than scoring it False -- a missing grader reads as a terrible model.
+    cases = [("gsm8k", "the answer is 42", "42", None),
+             ("coqa", "Joe Ladue.", "joe ladue", None),
+             ("overruling", "Yes.", "Yes", None),
+             ("headlines", "COMEDY", "COMEDY", None),
+             ("humaneval", _BODY, None, _META)]
+    for dataset, answer, gold, meta in cases:
+        assert grade(dataset, answer, gold, meta) is True, dataset
+    print("test_every_dataset_has_a_grader: PASS")
 
 
 def run_all():
