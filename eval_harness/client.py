@@ -42,7 +42,58 @@ import os
 import random
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# ---------------------------------------------------------------------------
+# .env
+# ---------------------------------------------------------------------------
+# The MissingAPIKey message tells you to put the key in a .env, so
+# something has to read one. Twelve lines of stdlib rather than a
+# python-dotenv dependency: this is the only place in the harness that
+# needs it, and requirements.txt is one package for a reason.
+#
+# Searched upwards from the package, because the repo is often a
+# subdirectory of the checkout and the .env lands next to it rather than
+# inside it. Environment variables always win over the file -- an
+# explicit export should not be silently overridden by a stale .env.
+# ---------------------------------------------------------------------------
+
+_DOTENV_SEARCH_DEPTH = 3
+_dotenv_loaded = False
+
+
+def load_dotenv(start: Optional[Path] = None) -> Optional[Path]:
+    """Load the nearest .env into os.environ. Returns the file used, if any."""
+    global _dotenv_loaded
+
+    here = (start or Path(__file__).resolve().parent)
+    for directory in [here, *here.parents][:_DOTENV_SEARCH_DEPTH + 1]:
+        candidate = directory / ".env"
+        if not candidate.is_file():
+            continue
+        try:
+            text = candidate.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].lstrip()
+            key, sep, value = line.partition("=")
+            if not sep:
+                continue
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            # Never clobber a real environment variable.
+            if key and key not in os.environ:
+                os.environ[key] = value
+        _dotenv_loaded = True
+        return candidate
+    return None
+
 
 # Base URLs for the OpenAI-compatible endpoints. The env var names are
 # each provider's own convention, so an existing key works unchanged.
@@ -98,6 +149,9 @@ class Client:
         spec = PROVIDERS[self.provider]
 
         key = self.api_key or os.environ.get(spec["env"])
+        if not key and not _dotenv_loaded:
+            load_dotenv()
+            key = os.environ.get(spec["env"])
         if not key:
             raise MissingAPIKey(
                 f"No API key for provider {self.provider!r}. "

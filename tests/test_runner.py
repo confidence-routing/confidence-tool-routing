@@ -370,6 +370,50 @@ def test_retrieval_tool_cost_is_the_passage_tokens():
     print("test_retrieval_tool_cost_is_the_passage_tokens: PASS")
 
 
+def test_dotenv_is_actually_read():
+    # MissingAPIKey's message tells the user to put the key in a .env, so
+    # something has to read one. Before this, nothing did -- the message
+    # was wrong, which is worse than no message.
+    import os
+    import tempfile
+    from pathlib import Path as _Path
+    from eval_harness.client import load_dotenv
+
+    d = _Path(tempfile.mkdtemp())
+    (d / ".env").write_text(
+        "# a comment\n"
+        "\n"
+        "export QUOTED_KEY=\"quoted-value\"\n"
+        "PLAIN_KEY=plain-value\n"
+        "ALREADY_SET=from-file\n",
+        encoding="utf-8")
+
+    os.environ["ALREADY_SET"] = "from-environment"
+    for name in ("QUOTED_KEY", "PLAIN_KEY"):
+        os.environ.pop(name, None)
+    try:
+        used = load_dotenv(start=d)
+        assert used == d / ".env", used
+        # export prefix stripped, quotes stripped, comments and blanks skipped
+        assert os.environ["QUOTED_KEY"] == "quoted-value"
+        assert os.environ["PLAIN_KEY"] == "plain-value"
+        # a real environment variable must win: an explicit export should
+        # not be silently overridden by a stale .env
+        assert os.environ["ALREADY_SET"] == "from-environment"
+    finally:
+        for name in ("QUOTED_KEY", "PLAIN_KEY", "ALREADY_SET"):
+            os.environ.pop(name, None)
+    print("test_dotenv_is_actually_read: PASS")
+
+
+def test_dotenv_missing_is_not_an_error():
+    import tempfile
+    from pathlib import Path as _Path
+    from eval_harness.client import load_dotenv
+    assert load_dotenv(start=_Path(tempfile.mkdtemp())) is None
+    print("test_dotenv_missing_is_not_an_error: PASS")
+
+
 def run_all():
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     for t in tests:
