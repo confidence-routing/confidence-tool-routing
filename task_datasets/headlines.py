@@ -31,7 +31,7 @@ import json
 import sys
 import urllib.request
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from .base import DatasetLoader, TaskItem, register
 
@@ -44,6 +44,19 @@ _HF_ROWS_URL = (
 # The full dataset has ~209k rows. We paginate through the rows API.
 _PAGE_SIZE = 100
 _TOTAL_ROWS = 209_527  # from the API's num_rows_total
+
+
+def _cached_rows(cache: Path) -> Optional[int]:
+    """How many rows the cache holds, or None if there is no cache.
+
+    Split out so the reuse decision is testable without a download --
+    every other test in this suite runs offline, and the bug this guards
+    against is precisely one that a cached file makes invisible.
+    """
+    if not cache.exists():
+        return None
+    with open(cache, "r", encoding="utf-8") as fh:
+        return sum(1 for line in fh if line.strip())
 
 
 @register("headlines")
@@ -59,11 +72,27 @@ class HeadlinesLoader(DatasetLoader):
 
     def download(self) -> None:
         cache = self.data_dir / "headlines.jsonl"
-        if cache.exists():
-            return
+
+        # This loader caps the DOWNLOAD at max_samples, unlike the others:
+        # 209k rows over a 100-row paginated API is ~2,100 requests, which
+        # is not worth making to sample a few hundred. The consequence is
+        # that the cache holds however many the FIRST call asked for, so a
+        # later larger request was served silently short -- ask for 5, then
+        # ask for 500, and get 5 with nothing saying so. A run quietly
+        # 100x smaller than intended still prints a full-looking report.
+        #
+        # So the cache is only reusable when it already holds at least as
+        # many rows as this call wants.
+        wanted = self.max_samples or _TOTAL_ROWS
+        have = _cached_rows(cache)
+        if have is not None:
+            if have >= wanted:
+                return
+            print(f"  Cached headlines hold {have} rows, {wanted} requested; "
+                  f"re-downloading ...", file=sys.stderr)
 
         print(f"  Downloading headlines via HuggingFace rows API ...", file=sys.stderr)
-        total = self.max_samples if self.max_samples else _TOTAL_ROWS
+        total = wanted
         rows_collected = 0
         tmp = cache.with_suffix(".tmp")
 
