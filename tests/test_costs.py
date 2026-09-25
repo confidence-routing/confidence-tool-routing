@@ -25,7 +25,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from eval_harness import costs
-from eval_harness.costs import estimate_cost_usd, estimate_record_cost_usd
+from eval_harness.costs import (
+    PRICING_SOURCES, estimate_cost_usd, estimate_record_cost_usd,
+    register_pricing,
+)
 from eval_harness.models import TaskRecord
 
 
@@ -296,6 +299,60 @@ def test_unknown_fields_are_kept_not_dropped():
     assert rec.meta["existing"] == 1, rec.meta
     assert rec.meta["_unknown_fields"] == {"confidence_prompt_tokens_v2": 500}, rec.meta
     print("test_unknown_fields_are_kept_not_dropped: PASS")
+
+
+# ---------------------------------------------------------------------------
+# register_pricing -- a counterfactual rate for a model with no price
+# ---------------------------------------------------------------------------
+
+def test_registering_a_rate_makes_a_model_priceable():
+    # A locally served model has no rate of its own, and CPST on a free run
+    # has to be the counterfactual: what the SAME model would have cost at
+    # a named provider.
+    register_pricing("test-local-model", 0.18, 0.36,
+                     source="example-provider 2026-09-25")
+    with pricing_age(1):
+        # 1M in + 1M out = 0.18 + 0.36
+        cost = estimate_cost_usd("test-local-model", 1_000_000, 1_000_000)
+    assert abs(cost - 0.54) < 1e-9, cost
+    assert PRICING_SOURCES["test-local-model"] == "example-provider 2026-09-25"
+    print("test_registering_a_rate_makes_a_model_priceable: PASS")
+
+
+def test_an_unattributed_rate_is_refused():
+    # An untraceable rate is worse than a missing one: estimate_cost_usd
+    # refuses to price an unknown model, which is a visible failure, while
+    # a made-up rate silently produces a number that reaches a paper.
+    for bad in ("", "   ", None):
+        try:
+            register_pricing("test-bad", 1.0, 1.0, source=bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted source={bad!r}")
+    print("test_an_unattributed_rate_is_refused: PASS")
+
+
+def test_a_placeholder_source_is_refused():
+    # The Colab notebook ships this exact string, so it has to fail loudly
+    # rather than quietly pricing a run at an invented rate.
+    for bad in ("REPLACE: provider + date", "TODO", "fixme", "?"):
+        try:
+            register_pricing("test-placeholder", 1.0, 1.0, source=bad)
+        except ValueError as exc:
+            assert "placeholder" in str(exc).lower(), exc
+            continue
+        raise AssertionError(f"accepted placeholder source={bad!r}")
+    print("test_a_placeholder_source_is_refused: PASS")
+
+
+def test_negative_and_nan_rates_are_refused():
+    for bad in (-0.1, float("nan"), "free"):
+        try:
+            register_pricing("test-rate", bad, 1.0, source="p 2026-09-25")
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted rate={bad!r}")
+    print("test_negative_and_nan_rates_are_refused: PASS")
 
 
 def run_all():

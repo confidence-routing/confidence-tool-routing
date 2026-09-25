@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from eval_harness import RunLogger, build_report, print_report
 from eval_harness.client import DEFAULT_PROVIDER, Client, MissingAPIKey
+from eval_harness.costs import register_pricing
 from eval_harness.confidence import ConfidenceMethod
 from eval_harness.labeling import apply_labels, load_labels
 from eval_harness.models import ToolNecessity
@@ -70,9 +71,38 @@ def main(argv=None) -> int:
     p.add_argument("--labels", default=None,
                    help="tool_necessity labels (default labels/<dataset>.json "
                         "if present); produced by examples.label_pilot")
+    # A model served locally or on a free tier has no rate of its own,
+    # and CPST has to be the counterfactual: what the SAME model would
+    # have cost at a named provider. Passed here rather than edited
+    # into costs.py so the provenance travels with the command that
+    # produced the numbers.
+    p.add_argument("--price-in", type=float, default=None,
+                   help="USD per 1M input tokens for --model")
+    p.add_argument("--price-out", type=float, default=None,
+                   help="USD per 1M output tokens for --model")
+    p.add_argument("--price-source", default=None,
+                   help="provider and date the rate was checked, "
+                        "e.g. 'together.ai 2026-09-25'")
     p.add_argument("--probe", action="store_true",
                    help="check the model returns logprobs, then exit")
     args = p.parse_args(argv)
+
+    price_args = (args.price_in, args.price_out)
+    if any(v is not None for v in price_args) or args.price_source:
+        if not all(v is not None for v in price_args) or not args.price_source:
+            print("--price-in, --price-out and --price-source go together: a rate "
+                  "with no attribution is worse than no rate, since CPST refusing "
+                  "to compute is visible and a made-up number is not.",
+                  file=sys.stderr)
+            return 2
+        try:
+            register_pricing(args.model, args.price_in, args.price_out,
+                             source=args.price_source)
+        except ValueError as exc:
+            print(f"{exc}", file=sys.stderr)
+            return 2
+        print(f"priced {args.model}: ${args.price_in}/M in, ${args.price_out}/M out "
+              f"({args.price_source})")
 
     try:
         client = Client(provider=args.provider)

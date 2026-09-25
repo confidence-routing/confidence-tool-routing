@@ -100,6 +100,59 @@ PRICING_TABLE: Dict[str, ModelPricing] = {
 DEFAULT_MODEL = "gpt-4o-mini"
 
 
+# ---------------------------------------------------------------------------
+# Registering a counterfactual rate
+# ---------------------------------------------------------------------------
+
+# Where each registered rate came from, so a results table can state it.
+PRICING_SOURCES: Dict[str, str] = {}
+
+
+def register_pricing(
+    model_name: str,
+    input_per_million: float,
+    output_per_million: float,
+    *,
+    source: str,
+    cached_input_per_million: float = 0.0,
+) -> None:
+    """
+    Add a model's rate at run time, for a model served somewhere without a
+    price of its own -- a local server, or a free tier.
+
+    This exists because CPST on a free run has to be counterfactual: what
+    the SAME model would have cost at a named provider's rate. Editing this
+    file from a notebook to achieve that is how a rate ends up in a paper
+    with nobody able to say where it came from, so ``source`` is required
+    and kept in PRICING_SOURCES.
+
+    ``source`` should name the provider and the date it was checked, e.g.
+    "together.ai 2026-09-25". It is not validated -- it cannot be -- but a
+    blank or obviously-placeholder value raises, because an unattributed
+    rate is worse than a missing one: estimate_cost_usd() refuses to price
+    a model it does not know, which is a visible failure, while a made-up
+    rate silently produces a number.
+    """
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError("source is required: name the provider and the date checked")
+    placeholder = source.strip().upper()
+    if placeholder.startswith("REPLACE") or placeholder in {"TODO", "FIXME", "?"}:
+        raise ValueError(
+            f"source is still a placeholder ({source!r}). Put the provider and "
+            f"the date you checked its price page, or leave the model unpriced "
+            f"-- CPST refusing to compute is better than a rate nobody can trace."
+        )
+    for label, rate in (("input", input_per_million), ("output", output_per_million),
+                        ("cached input", cached_input_per_million)):
+        if not isinstance(rate, (int, float)) or rate != rate or rate < 0:
+            raise ValueError(f"{label} rate must be a non-negative number, got {rate!r}")
+
+    PRICING_TABLE[model_name] = ModelPricing(
+        float(input_per_million), float(output_per_million),
+        float(cached_input_per_million))
+    PRICING_SOURCES[model_name] = source.strip()
+
+
 def estimate_cost_usd(
     model_name: str,
     prompt_tokens: int,
