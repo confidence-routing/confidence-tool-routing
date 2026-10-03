@@ -53,13 +53,32 @@ def compute_cpst(records: Sequence[TaskRecord]) -> CPSTResult:
 
     Tasks with num_correct == 0 return cpst_usd = None / cpst_tokens = None
     (undefined — avoid division by zero, don't silently report inf).
+
+    An UNPRICED model also yields cpst_usd = None, with cpst_tokens
+    intact. A model served locally, or one whose provider has retired it
+    from their price page, has no rate to apply, and estimate_cost_usd()
+    rightly refuses to guess one. That must not take the whole report
+    down: the token-denominated CPST needs no rate, is fully comparable
+    across estimators, and is the honest number in that case.
+
+    None here means "no rate available", never "free". The distinction
+    matters because free is exactly what an unpriced model would look
+    like if the cost were quietly treated as zero — which is the mistake
+    the whole confidence-stage billing change existed to fix.
     """
     total_cost_usd = 0.0
     total_tokens = 0
     num_correct = 0
+    priced = True
 
     for r in records:
-        total_cost_usd += estimate_record_cost_usd(r)
+        if priced:
+            try:
+                total_cost_usd += estimate_record_cost_usd(r)
+            except KeyError:
+                # No rate for this model. Stop accumulating rather than
+                # reporting a total that covers only some of the records.
+                priced = False
         total_tokens += r.total_prompt_tokens + r.total_completion_tokens
         if r.correct:
             num_correct += 1
@@ -67,8 +86,10 @@ def compute_cpst(records: Sequence[TaskRecord]) -> CPSTResult:
     num_tasks = len(records)
     success_rate = num_correct / num_tasks if num_tasks else 0.0
 
-    cpst_usd = total_cost_usd / num_correct if num_correct else None
+    cpst_usd = (total_cost_usd / num_correct) if (num_correct and priced) else None
     cpst_tokens = total_tokens / num_correct if num_correct else None
+    if not priced:
+        total_cost_usd = 0.0
 
     return CPSTResult(
         cpst_usd=cpst_usd,

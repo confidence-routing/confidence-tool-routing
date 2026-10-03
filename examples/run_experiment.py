@@ -38,7 +38,7 @@ from eval_harness import RunLogger, build_report, print_report
 from eval_harness.client import DEFAULT_PROVIDER, Client, MissingAPIKey
 from eval_harness.costs import register_pricing
 from eval_harness.confidence import ConfidenceMethod
-from eval_harness.labeling import apply_labels, load_labels
+from eval_harness.labeling import apply_labels, load_labels, tasks_in_split
 from eval_harness.models import ToolNecessity
 from eval_harness.runner import RunConfig, run_dataset
 from task_datasets import load_dataset
@@ -68,6 +68,10 @@ def main(argv=None) -> int:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--run-id", default=None)
     p.add_argument("--log-dir", default="runs")
+    p.add_argument("--split", default="eval", choices=["eval", "pilot", "all"],
+                   help="which half of the labelled tasks to run (default eval). "
+                        "Thresholds are chosen on pilot, so reporting on pilot "
+                        "scores the cut against the sample it was tuned on.")
     p.add_argument("--labels", default=None,
                    help="tool_necessity labels (default labels/<dataset>.json "
                         "if present); produced by examples.label_pilot")
@@ -144,8 +148,16 @@ def main(argv=None) -> int:
                 f"tool_necessity is model-relative, so these labels describe "
                 f"a different model's limits.", UserWarning, stacklevel=1)
         labelled = apply_labels(tasks, label_set, strict=False)
+        if args.split != "all":
+            in_split = tasks_in_split(labelled, label_set, args.split)
+            if not in_split:
+                print(f"No tasks tagged '{args.split}' in {label_path}. The label "
+                      f"file may predate split tagging; re-run label_pilot or pass "
+                      f"--split all.", file=sys.stderr)
+                return 1
+            labelled = in_split
         print(f"labels: {sum(1 for t in labelled if t.get('tool_necessity'))}"
-              f"/{len(tasks)} from {label_path}")
+              f"/{len(labelled)} from {label_path} (split={args.split})")
         tasks = labelled
     elif args.labels:
         print(f"No label file at {label_path}", file=sys.stderr)
