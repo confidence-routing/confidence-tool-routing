@@ -33,13 +33,23 @@ of the question "did this need a tool", not a flaw -- but it means a
 label set belongs to the model that produced it, which is why
 save_labels records the model and the trial count alongside.
 
-And it is circular if you are careless. Defining "needed a tool" as "the
-model failed without one" and then grading the router on the same tasks
-measures the router against the model's own failures. The standard
-guard, and the one the pilot script applies, is to label a held-out
-split and evaluate on a different one, so the router is never scored on
-the tasks whose labels it was tuned against. Say so in the writeup
-either way -- it is a definition, not a measurement.
+And it needs a split, but not where it first seems. Defining "needed a
+tool" as "the model failed without one" and then TUNING A THRESHOLD on
+the same tasks you report on overfits the cut to that sample. The guard
+is to select the threshold on one half and report on the other.
+
+That guard belongs at threshold selection, NOT at labelling. An earlier
+version of this labelled only one half, which left the other half with
+no ground truth and therefore no routing metrics at all -- precision,
+recall and the call rates all key off tool_necessity, so an unlabelled
+evaluation set cannot be graded. Both halves get labelled; ``split``
+records which is which, and the analysis honours it.
+
+What a split cannot fix is the definitional circularity: the confidence
+score and the label both derive from the same model's behaviour on the
+same question. That is a property of the question "did this need a
+tool", which is genuinely model-relative, and it belongs in the writeup
+as a stated definition rather than something a split launders away.
 """
 
 from __future__ import annotations
@@ -75,6 +85,7 @@ def label_tool_necessity(
     trials: int = DEFAULT_TRIALS,
     temperature: float = DEFAULT_TEMPERATURE,
     max_tokens: int = 512,
+    split: Optional[str] = None,
     progress: Optional[Callable[[int, int, str], None]] = None,
 ) -> Dict[str, Any]:
     """
@@ -126,7 +137,42 @@ def label_tool_necessity(
         "created": time.time(),
         "labels": labels,
         "n_correct": detail,
+        "split": {task_id: split for task_id in labels} if split else {},
     }
+
+
+def merge_label_sets(existing: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Fold a new label set into an existing one.
+
+    Labelling runs per split, and each run costs real time, so adding the
+    second half must not discard the first. Refuses to merge label sets
+    from different models or trial counts: a label is only meaningful
+    next to the model that produced it, and silently mixing two would
+    make the ground truth untraceable.
+    """
+    if not existing:
+        return new
+    for field in ("model", "trials"):
+        if existing.get(field) != new.get(field):
+            raise ValueError(
+                f"refusing to merge label sets with different {field}: "
+                f"{existing.get(field)!r} vs {new.get(field)!r}. A label "
+                f"belongs to the model and trial count that produced it."
+            )
+    merged = dict(existing)
+    merged["labels"] = {**existing.get("labels", {}), **new.get("labels", {})}
+    merged["n_correct"] = {**existing.get("n_correct", {}), **new.get("n_correct", {})}
+    merged["split"] = {**existing.get("split", {}), **new.get("split", {})}
+    merged["created"] = new.get("created", existing.get("created"))
+    return merged
+
+
+def tasks_in_split(tasks: Sequence[Dict[str, Any]], label_set: Dict[str, Any],
+                   split: str) -> List[Dict[str, Any]]:
+    """The tasks a label set assigned to ``split``, in the given order."""
+    assignment = label_set.get("split", {})
+    return [t for t in tasks if assignment.get(str(t.get("task_id", ""))) == split]
 
 
 def _answer_text(response: Any) -> str:

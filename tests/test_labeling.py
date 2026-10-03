@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from eval_harness.labeling import (
     apply_labels, decide_label, label_tool_necessity, load_labels,
-    save_labels, split_tasks, summarize,
+    merge_label_sets, save_labels, split_tasks, summarize, tasks_in_split,
 )
 
 GSM = {"task_id": "g1", "dataset": "gsm8k", "query": "6*7?", "gold_answer": "42"}
@@ -123,6 +123,67 @@ def test_summarize_counts_every_label_kind():
                                    "c": "not_required"}})
     assert counts == {"required": 2, "not_required": 1, "ambiguous": 0}
     print("test_summarize_counts_every_label_kind: PASS")
+
+
+# ---------------------------------------------------------------------------
+# Both halves get labelled; the split is honoured later
+# ---------------------------------------------------------------------------
+
+def test_the_split_a_label_belongs_to_is_recorded():
+    out = label_tool_necessity(ScriptedClient(["42"]*3), [GSM], "m",
+                               trials=3, split="eval")
+    assert out["split"] == {"g1": "eval"}
+    print("test_the_split_a_label_belongs_to_is_recorded: PASS")
+
+
+def test_merging_keeps_both_halves():
+    # REGRESSION. An earlier version labelled only the pilot half, leaving
+    # the evaluation half with no ground truth and therefore no routing
+    # metrics at all -- precision, recall and both call rates key off
+    # tool_necessity. Both halves are labelled now, and adding the second
+    # must not discard the first, since each costs real time.
+    pilot = label_tool_necessity(ScriptedClient(["42"]*3), [GSM], "m",
+                                 trials=3, split="pilot")
+    other = dict(GSM, task_id="g2")
+    ev = label_tool_necessity(ScriptedClient(["41"]*3), [other], "m",
+                              trials=3, split="eval")
+    merged = merge_label_sets(pilot, ev)
+    assert merged["labels"] == {"g1": "not_required", "g2": "required"}
+    assert merged["split"] == {"g1": "pilot", "g2": "eval"}
+    assert set(merged["n_correct"]) == {"g1", "g2"}
+    print("test_merging_keeps_both_halves: PASS")
+
+
+def test_merging_across_models_is_refused():
+    # A label is only meaningful next to the model that produced it, so
+    # silently mixing two would make the ground truth untraceable.
+    a = label_tool_necessity(ScriptedClient(["42"]*3), [GSM], "model-a", trials=3)
+    b = label_tool_necessity(ScriptedClient(["42"]*3), [GSM], "model-b", trials=3)
+    for pair in ((a, b), (a, {**b, "model": "model-a", "trials": 5})):
+        try:
+            merge_label_sets(*pair)
+        except ValueError:
+            continue
+        raise AssertionError("merged mismatched label sets")
+    print("test_merging_across_models_is_refused: PASS")
+
+
+def test_merging_into_nothing_is_the_new_set():
+    new = label_tool_necessity(ScriptedClient(["42"]*3), [GSM], "m", trials=3)
+    assert merge_label_sets({}, new) == new
+    print("test_merging_into_nothing_is_the_new_set: PASS")
+
+
+def test_tasks_in_split_filters_by_assignment():
+    # The threshold is selected on the pilot half and reported on the eval
+    # half, so the analysis needs to recover which is which.
+    label_set = {"split": {"g1": "pilot", "g2": "eval", "g3": "eval"}}
+    tasks = [{"task_id": "g1"}, {"task_id": "g2"}, {"task_id": "g3"}]
+    assert [t["task_id"] for t in tasks_in_split(tasks, label_set, "eval")] == ["g2", "g3"]
+    assert [t["task_id"] for t in tasks_in_split(tasks, label_set, "pilot")] == ["g1"]
+    # unlabelled tasks belong to neither
+    assert tasks_in_split([{"task_id": "unknown"}], label_set, "eval") == []
+    print("test_tasks_in_split_filters_by_assignment: PASS")
 
 
 def run_all():

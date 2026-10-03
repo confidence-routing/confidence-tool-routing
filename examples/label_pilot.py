@@ -21,10 +21,15 @@ almost every task labels not_required, the positive class is empty, and
 routing cannot be measured on it whatever the estimator does. The
 summary prints that split, so it is a number rather than a hunch.
 
-Only the PILOT half is labelled. The eval half is held out on purpose:
-scoring the router on the same tasks whose labels came from the model's
-own failures would make "needed a tool" and "the router escalated" two
-readings of one measurement.
+BOTH halves are labelled, and each is tagged with which split it belongs
+to. An earlier version labelled only the pilot half, which left the
+evaluation half with no ground truth and therefore no routing metrics at
+all -- precision, recall and both call rates key off tool_necessity.
+
+The split still matters, just later: the threshold is selected on the
+pilot half and reported on the eval half, so the cut is never tuned on
+the sample it is scored against. That guard belongs at threshold
+selection, not at labelling.
 """
 
 from __future__ import annotations
@@ -37,7 +42,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from eval_harness.client import DEFAULT_PROVIDER, Client, MissingAPIKey
 from eval_harness.labeling import (
-    label_tool_necessity, save_labels, split_tasks, summarize,
+    label_tool_necessity, load_labels, merge_label_sets, save_labels,
+    split_tasks, summarize,
 )
 from task_datasets import load_dataset
 
@@ -59,6 +65,10 @@ def main(argv=None) -> int:
     p.add_argument("--provider", default=DEFAULT_PROVIDER)
     p.add_argument("--model", default="gpt-oss-120b")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--split", default="all",
+                   choices=["all", "pilot", "eval"],
+                   help="which half to label (default all); labels merge "
+                        "into any existing file rather than replacing it")
     p.add_argument("--out", default=None)
     args = p.parse_args(argv)
 
@@ -70,18 +80,25 @@ def main(argv=None) -> int:
 
     tasks = load_dataset(args.dataset, max_samples=args.limit)
     split = split_tasks(tasks, pilot_fraction=args.pilot_fraction, seed=args.seed)
-    pilot = split["pilot"]
+    wanted = ["pilot", "eval"] if args.split == "all" else [args.split]
 
-    print(f"{args.dataset}: {len(tasks)} loaded -> {len(pilot)} pilot / "
-          f"{len(split['eval'])} held out | {args.model} | {args.trials} trials")
+    print(f"{args.dataset}: {len(tasks)} loaded -> {len(split['pilot'])} pilot / "
+          f"{len(split['eval'])} eval | labelling: {', '.join(wanted)} | "
+          f"{args.model} | {args.trials} trials")
     print("  R = needed a tool, . = did not, ? = inconsistent")
 
-    label_set = label_tool_necessity(
-        client, pilot, args.model, trials=args.trials,
-        temperature=args.temperature, progress=_progress)
-
     out = args.out or f"labels/{args.dataset}.json"
-    save_labels(label_set, out)
+    # Merge rather than replace: each half costs real time to label, and
+    # adding the second must not discard the first.
+    label_set = load_labels(out) if Path(out).exists() else {}
+
+    for name in wanted:
+        print(f"  [{name}]", end=" ", flush=True)
+        part = label_tool_necessity(
+            client, split[name], args.model, trials=args.trials,
+            temperature=args.temperature, split=name, progress=_progress)
+        label_set = merge_label_sets(label_set, part)
+        save_labels(label_set, out)   # checkpoint after each half
 
     counts = summarize(label_set)
     total = sum(counts.values()) or 1
