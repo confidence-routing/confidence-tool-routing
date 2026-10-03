@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from task_datasets.base import DatasetLoader, TaskItem, load_dataset, list_datasets
 from task_datasets.gsm8k import GSM8KLoader, _extract_final_answer
+from task_datasets.headlines import _cached_rows
 from task_datasets.humaneval import HumanEvalLoader
 
 
@@ -215,6 +216,38 @@ def test_tool_necessity_is_not_asserted_by_loaders():
     item = _tmp_loader(GSM8KLoader, test__jsonl=rows).parse()[0]
     assert "tool_necessity" not in item, item
     print("test_tool_necessity_is_not_asserted_by_loaders: PASS")
+
+
+# ---------------------------------------------------------------------------
+# Headlines cache -- a truncated cache must not be reused for a bigger ask
+# ---------------------------------------------------------------------------
+
+def test_no_cache_reports_none():
+    assert _cached_rows(Path(tempfile.mkdtemp()) / "missing.jsonl") is None
+    print("test_no_cache_reports_none: PASS")
+
+
+def test_cached_rows_counts_non_blank_lines():
+    f = Path(tempfile.mkdtemp()) / "c.jsonl"
+    f.write_text("a\n\nb\nc\n", encoding="utf-8")
+    assert _cached_rows(f) == 3
+    print("test_cached_rows_counts_non_blank_lines: PASS")
+
+
+def test_a_short_cache_is_detectable():
+    # REGRESSION. Unlike the other loaders, headlines caps its DOWNLOAD at
+    # max_samples -- 209k rows over a 100-row API is ~2,100 requests. So
+    # the cache holds whatever the first call asked for, and reusing it
+    # blindly served a later larger request short: ask for 5, then 500, get
+    # 5, with nothing saying so. A run 100x smaller than intended still
+    # prints a full-looking report.
+    f = Path(tempfile.mkdtemp()) / "c.jsonl"
+    f.write_text("\n".join(["{}"] * 5) + "\n", encoding="utf-8")
+    have = _cached_rows(f)
+    assert have == 5
+    assert have < 500, "a 5-row cache must not satisfy a 500-row request"
+    assert have >= 5, "but it must still satisfy a 5-row request"
+    print("test_a_short_cache_is_detectable: PASS")
 
 
 def run_all():

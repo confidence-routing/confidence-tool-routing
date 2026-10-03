@@ -61,7 +61,7 @@ python -m pytest tests/ -v        # verify the math
   category, evaluate ECE on another.
 - **Pricing table needs periodic verification.** OpenAI revises rates.
   `costs.py` documents this at the top — check
-  https://openai.com/api/pricing before trusting CPST numbers in a
+  Cerebras and Groq inference providers before trusting CPST numbers in a
   results table.
 
 - **The router owns the cut, not the tool choice.** `route()` answers
