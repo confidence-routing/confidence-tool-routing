@@ -2,13 +2,24 @@
 costs.py
 ========
 
-OpenAI token pricing and cost-estimation helpers.
+Token pricing and cost-estimation helpers.
 
-IMPORTANT: OpenAI revises pricing periodically. The table below reflects
-rates commonly reported as of mid-2026. Before running real experiments,
-verify against https://openai.com/api/pricing and update PRICING_TABLE
-and PRICING_VERIFIED_DATE. Keeping this in one place means a price change
+Covers more than one provider. Runs on a free tier still get a cost:
+CPST is reported as what the run WOULD have cost at the same model's
+paid rate, which is the only defensible way to compare estimators whose
+whole difference is cost. The rule that keeps it defensible is that a
+model is priced at its own rate on a named provider -- never at some
+other model's rate, and never at a substitute's.
+
+IMPORTANT: providers revise pricing. Verify against the provider's own
+page and update PRICING_TABLE and PRICING_VERIFIED_DATE before trusting
+CPST in a results table. Keeping this in one place means a price change
 is a one-line edit, not a hunt through the codebase.
+
+PRICING_VERIFIED_DATE is deliberately NOT bumped for a partial check:
+the Cerebras rates below were verified 2026-09-23, the OpenAI ones were
+not, so the staleness warning still fires -- correctly -- for the half
+that is unverified.
 
 All rates are USD per 1,000,000 tokens.
 """
@@ -70,6 +81,20 @@ PRICING_TABLE: Dict[str, ModelPricing] = {
     # lightweight external-verifier candidates
     "gpt-4o-mini":        ModelPricing(0.15, 0.60, 0.075),
     "o4-mini":            ModelPricing(1.10, 4.40, 0.275),
+
+    # ---- Cerebras developer tier, verified 2026-09-23 against
+    # https://www.cerebras.ai/pricing -----------------------------------
+    # Runs go through the free tier, so nothing is actually billed. These
+    # rates are what the same model on the same provider's paid tier would
+    # have cost, which is the honest counterfactual: no substituting one
+    # model's price for another's. No cached-input rate is published, so
+    # the third field stays 0.0 (not applicable) rather than guessed.
+    #
+    # Note the inversion before choosing a verifier: the 27B model is
+    # ~2.8x the input rate of the 120B one. On this provider the small
+    # model is NOT the cheap one.
+    "gpt-oss-120b":       ModelPricing(0.35, 0.75),
+    "qwen-3.8-27b":       ModelPricing(0.99, 1.49),
 }
 
 DEFAULT_MODEL = "gpt-4o-mini"
@@ -111,16 +136,51 @@ def estimate_cost_usd(
 
 def estimate_record_cost_usd(record) -> float:
     """
-    Convenience wrapper: estimate total USD cost for a TaskRecord, covering
-    both the main-model call and any tool round-trip tokens, plus whatever
-    flat tool_api_cost_usd was logged (e.g. a paid web-search API call).
+    Convenience wrapper: estimate total USD cost for a TaskRecord.
+
+    Three stages, all billed:
+
+      main        the answer itself, at record.model_name
+      tool        the tool round-trip's extra tokens, also at
+                  record.model_name, plus flat tool_api_cost_usd for
+                  non-token charges (e.g. a paid web-search call)
+      confidence  tokens spent ESTIMATING confidence rather than
+                  answering -- self-consistency's k-1 extra samples, the
+                  external verifier's call -- at confidence_model_name
+                  when set, else record.model_name, plus flat
+                  confidence_api_cost_usd
+
+    The confidence stage is billed separately because it is routinely a
+    different model: a verifier is deliberately cheaper than the model it
+    checks. Leaving it out (as this function did before) makes free token
+    entropy and k-sample self-consistency cost exactly the same, which
+    hides the one difference the routing argument depends on.
+
+    Records logged before these fields existed default every one of them
+    to zero, so old runs price exactly as they did before.
     """
     main_cost = estimate_cost_usd(
         record.model_name, record.prompt_tokens, record.completion_tokens
     )
+
     tool_token_cost = 0.0
     if record.tool_prompt_tokens or record.tool_completion_tokens:
         tool_token_cost = estimate_cost_usd(
             record.model_name, record.tool_prompt_tokens, record.tool_completion_tokens
         )
-    return main_cost + tool_token_cost + record.tool_api_cost_usd
+
+    confidence_token_cost = 0.0
+    if record.confidence_prompt_tokens or record.confidence_completion_tokens:
+        confidence_token_cost = estimate_cost_usd(
+            record.confidence_model_name or record.model_name,
+            record.confidence_prompt_tokens,
+            record.confidence_completion_tokens,
+        )
+
+    return (
+        main_cost
+        + tool_token_cost
+        + record.tool_api_cost_usd
+        + confidence_token_cost
+        + record.confidence_api_cost_usd
+    )
