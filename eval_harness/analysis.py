@@ -188,6 +188,45 @@ def compare_runs(grouped: Dict[RunKey, List[TaskRecord]]) -> List[RunSummary]:
 
 
 # ---------------------------------------------------------------------------
+# Objectives for threshold selection
+# ---------------------------------------------------------------------------
+# Which objective you pick decides what the transfer matrix measures, and
+# "f1" is the wrong default on this data. F1 rewards predicting the
+# majority class, and CoQA is 72% tool-required -- so maximising it pushes
+# the threshold to 1.00, i.e. "escalate always". Two datasets then agree
+# on a degenerate cut and transfer looks perfect while measuring nothing.
+#
+# cost_weighted asks the question a deployment actually asks: among cuts
+# that miss no more than max_missed of the tasks that needed a tool, take
+# the one that wastes the fewest calls on tasks that did not. That has a
+# real operating point, so a threshold selected under it carries
+# information a second dataset can disagree with.
+
+
+def cost_weighted_objective(max_missed: float = 0.10) -> Callable:
+    """Fewest unnecessary calls, subject to a cap on missed ones.
+
+    Returns None for a point that breaks the constraint, which
+    select_threshold skips -- so if no cut satisfies it, selection
+    reports nothing rather than quietly relaxing the requirement.
+    """
+    def objective(point) -> Optional[float]:
+        if point.missed_call_rate is None or point.unnecessary_call_rate is None:
+            return None
+        if point.missed_call_rate > max_missed:
+            return None
+        return -point.unnecessary_call_rate
+    return objective
+
+
+OBJECTIVES: Dict[str, Callable] = {
+    "f1": lambda p: p.f1,
+    "cost": cost_weighted_objective(0.10),
+    "cost25": cost_weighted_objective(0.25),
+}
+
+
+# ---------------------------------------------------------------------------
 # Cross-tool transfer -- the headline
 # ---------------------------------------------------------------------------
 

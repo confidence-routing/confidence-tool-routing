@@ -33,7 +33,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from eval_harness.analysis import (
-    breakeven_tool_fee, compare_runs, load_run_dir, transfer_matrix,
+    OBJECTIVES, breakeven_tool_fee, compare_runs, load_run_dir, transfer_matrix,
 )
 
 
@@ -48,6 +48,11 @@ def _usd(x):
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Compare runs across estimators and datasets.")
     p.add_argument("--log-dir", default="runs")
+    p.add_argument("--objective", default="cost", choices=sorted(OBJECTIVES),
+                   help="threshold-selection objective for the transfer matrix. "
+                        "'cost' = fewest unnecessary calls while missing <=10%% of "
+                        "required tasks. 'f1' is shown for comparison but rewards "
+                        "blanket escalation when the required class dominates.")
     p.add_argument("--method", default=None,
                    help="restrict the transfer matrix to one estimator "
                         "(default: whichever has the most datasets)")
@@ -97,15 +102,15 @@ def main(argv=None) -> int:
 
     print()
     print("=" * 108)
-    print(f"  TRANSFER — threshold tuned on one dataset, applied to another  "
-          f"(estimator: {method})")
+    print(f"  TRANSFER — threshold tuned on one dataset, applied to another")
+    print(f"  estimator: {method}   objective: {args.objective}")
     print("=" * 108)
     if len(datasets) < 2:
         print(f"  Needs >=2 datasets for '{method}'; found "
               f"{sorted(datasets) or 'none'}.")
         print("  Run the same estimator on a second dataset to get this table.")
     else:
-        cells = transfer_matrix(datasets)
+        cells = transfer_matrix(datasets, objective=OBJECTIVES[args.objective])
         print(f"{'tuned on':12} {'evaluated on':14} {'threshold':>10} "
               f"{'F1':>8} {'own best':>9} {'lost':>8}")
         print("-" * 108)
