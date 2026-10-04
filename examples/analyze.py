@@ -63,16 +63,27 @@ def main(argv=None) -> int:
     print("=" * 108)
     print("  ESTIMATORS")
     print("=" * 108)
-    print(f"{'dataset':11} {'method':17} {'n':>5} {'succ':>7} {'CPST':>10} "
-          f"{'ECE':>7} {'P':>7} {'R':>7} {'F1':>7} {'tool%':>7} {'conf $':>10} {'conf%':>7}")
+    # Cost is shown in TOKENS: both the estimator and the tool are billed
+    # at the same model's rate, so the rate cancels out of every
+    # comparison here, and a locally served model has no rate at all.
+    print(f"{'dataset':11} {'method':17} {'n':>5} {'succ':>7} {'ECE':>8} "
+          f"{'P':>7} {'R':>7} {'F1':>7} {'tool%':>7} "
+          f"{'tok/task':>9} {'conf tok':>9} {'conf%':>7} {'CPST tok':>9}")
     print("-" * 108)
     for r in rows:
+        per_task = (r.total_tokens / r.n) if r.n else 0
+        conf_per_task = (r.confidence_tokens / r.n) if r.n else 0
         print(f"{r.dataset:11} {r.method:17} {r.n:>5} {_pct(r.success_rate)} "
-              f"{_usd(r.cpst_usd)} "
-              f"{'  n/a' if r.ece is None else f'{r.ece:7.4f}'} "
+              f"{'     n/a' if r.ece is None else f'{r.ece:8.4f}'} "
               f"{_pct(r.precision)} {_pct(r.recall)} {_pct(r.f1)} "
-              f"{_pct(r.tool_call_rate)} {_usd(r.confidence_cost_usd)} "
-              f"{_pct(r.confidence_cost_share)}")
+              f"{_pct(r.tool_call_rate)} "
+              f"{per_task:>9.0f} {conf_per_task:>9.0f} "
+              f"{_pct(r.confidence_token_share)} "
+              f"{'      n/a' if r.cpst_tokens is None else f'{r.cpst_tokens:9.0f}'}")
+    if all(r.confidence_cost_usd is None for r in rows):
+        print("\n  Dollar columns omitted: this model has no rate on any provider's")
+        print("  price page, and estimate_cost_usd() refuses to invent one. Tokens")
+        print("  are rate-free and are what every comparison above rests on.")
 
     # ---- 2. transfer matrix ----------------------------------------------
     # One estimator at a time: mixing them would confound a threshold that
@@ -114,22 +125,26 @@ def main(argv=None) -> int:
     # ---- 3. break-even ----------------------------------------------------
     print()
     print("=" * 108)
-    print("  BREAK-EVEN — per-call tool fee at which routing's spend equals always-calling")
+    print("  BREAK-EVEN — did routing cost less than always calling the tool?")
     print("=" * 108)
     print(f"{'dataset':11} {'method':17} {'direct':>7} {'tool':>6} "
-          f"{'routed $':>11} {'always $':>11} {'conf $':>10} {'break-even fee':>15}")
+          f"{'conf tok':>9} {'tool tok':>9} {'saved':>9} {'spent':>9} "
+          f"{'pays off':>9} {'fee needed':>11}")
     print("-" * 108)
     for (dataset, m) in sorted(grouped):
         b = breakeven_tool_fee(grouped[(dataset, m)])
-        fee = ("  n/a (none direct)" if b.breakeven_fee_usd is None
-               else f"${b.breakeven_fee_usd:.6f}")
+        saved = b.direct_calls * b.mean_tool_tokens
+        fee = ("        n/a" if b.breakeven_fee_tokens is None
+               else f"{b.breakeven_fee_tokens:11.0f}")
         print(f"{dataset:11} {m:17} {b.direct_calls:>7} {b.tool_calls:>6} "
-              f"{b.routed_spend_usd:>11.6f} {b.always_tool_spend_usd:>11.6f} "
-              f"{b.confidence_spend_usd:>10.6f} {fee:>15}")
+              f"{b.confidence_tokens:>9} {b.mean_tool_tokens:>9.0f} "
+              f"{saved:>9.0f} {b.confidence_tokens:>9} "
+              f"{'yes' if b.pays_off_now else 'NO':>9} {fee}")
     print()
-    print("  A fee at or below zero means the estimator is cheap enough to pay for")
-    print("  itself against a free tool. A positive fee is what the tool must charge")
-    print("  before routing is worth running at all.")
+    print("  saved = tool tokens the direct answers avoided; spent = tokens the")
+    print("  estimator cost across every task. 'fee needed' is the flat per-call")
+    print("  charge a tool would have to carry, in token-equivalents, before")
+    print("  routing breaks even -- zero means it already pays for itself.")
     print("=" * 108)
     return 0
 

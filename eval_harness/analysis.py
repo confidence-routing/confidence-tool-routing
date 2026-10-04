@@ -45,6 +45,29 @@ from .router import DEFAULT_THRESHOLDS, select_threshold, sweep_thresholds
 RunKey = Tuple[str, str]       # (dataset, confidence_method)
 
 
+def _cost_usd(record: TaskRecord) -> Optional[float]:
+    """Dollar cost, or None when the model has no rate.
+
+    A locally served model has no price, and estimate_cost_usd() rightly
+    refuses to invent one. None means "no rate", never "free".
+    """
+    try:
+        return estimate_record_cost_usd(record)
+    except KeyError:
+        return None
+
+
+def _confidence_tokens(record: TaskRecord) -> int:
+    """Tokens the confidence stage spent. Rate-free, so this is the column
+    that still works for an unpriced model -- and the one that makes the
+    estimator comparison possible at all."""
+    return record.confidence_prompt_tokens + record.confidence_completion_tokens
+
+
+def _tool_tokens(record: TaskRecord) -> int:
+    return record.tool_prompt_tokens + record.tool_completion_tokens
+
+
 # ---------------------------------------------------------------------------
 # Loading
 # ---------------------------------------------------------------------------
@@ -89,8 +112,13 @@ class RunSummary:
     unnecessary_call_rate: Optional[float]
     missed_call_rate: Optional[float]
     tool_call_rate: float
-    confidence_cost_usd: float      # what the estimator itself cost
-    confidence_cost_share: float    # as a fraction of total spend
+    # What the estimator itself cost. USD is None for an unpriced model;
+    # the token figures always work and are what the comparison rests on.
+    confidence_cost_usd: Optional[float]
+    confidence_cost_share: Optional[float]
+    confidence_tokens: int
+    confidence_token_share: float
+    total_tokens: int
 
 
 def summarize_run(dataset: str, method: str, records: Sequence[TaskRecord]) -> RunSummary:
@@ -103,11 +131,19 @@ def summarize_run(dataset: str, method: str, records: Sequence[TaskRecord]) -> R
     # What the confidence stage cost, separated out. This is the column the
     # whole project turns on: without it, free token entropy and k-sample
     # self-consistency are indistinguishable in a results table.
-    confidence_usd = 0.0
+    confidence_usd: Optional[float] = 0.0
+    confidence_tokens = 0
+    total_tokens = 0
     for r in records:
-        full = estimate_record_cost_usd(r)
-        stripped = estimate_record_cost_usd(_without_confidence_stage(r))
-        confidence_usd += full - stripped
+        confidence_tokens += _confidence_tokens(r)
+        total_tokens += r.total_prompt_tokens + r.total_completion_tokens
+        if confidence_usd is not None:
+            full = _cost_usd(r)
+            stripped = _cost_usd(_without_confidence_stage(r))
+            if full is None or stripped is None:
+                confidence_usd = None   # unpriced: stop, do not report a partial total
+            else:
+                confidence_usd += full - stripped
 
     return RunSummary(
         dataset=dataset, method=method, n=n,
@@ -119,7 +155,12 @@ def summarize_run(dataset: str, method: str, records: Sequence[TaskRecord]) -> R
         tool_call_rate=(sum(1 for r in records if r.tool_called) / n) if n else 0.0,
         confidence_cost_usd=confidence_usd,
         confidence_cost_share=(confidence_usd / cpst.total_cost_usd
-                               if cpst.total_cost_usd else 0.0),
+                               if (confidence_usd is not None and cpst.total_cost_usd)
+                               else None),
+        confidence_tokens=confidence_tokens,
+        confidence_token_share=(confidence_tokens / total_tokens
+                                if total_tokens else 0.0),
+        total_tokens=total_tokens,
     )
 
 
@@ -223,76 +264,100 @@ def _point_at(records, threshold, thresholds, on_missing):
 
 @dataclass
 class BreakevenResult:
-    routed_spend_usd: float          # what the run actually spent
-    always_tool_spend_usd: float     # if every task had called the tool
-    tool_calls: int
+    """
+    Whether routing paid for itself, and what it would take.
+
+    Stated in TOKENS as the primary unit. That is not a fallback for an
+    unpriced model -- it is the better formulation. Both sides of the
+    comparison are billed at the same model's rate, so the rate cancels
+    and the break-even is a pure token ratio. Dollar figures are filled
+    in when a rate happens to exist, and left None when it does not.
+    """
     direct_calls: int
-    confidence_spend_usd: float
-    breakeven_fee_usd: Optional[float]
-    current_fee_usd: float
+    tool_calls: int
+    confidence_tokens: int
+    mean_tool_tokens: float
+    # Extra tool tokens a direct answer avoided, against what the
+    # estimator cost to decide that. >1 means routing paid off.
+    saved_per_direct: float
+    spent_per_task: float
     pays_off_now: bool
+    # The flat per-call fee a tool would need to carry for routing to
+    # break even, expressed in token-equivalents of the same model.
+    breakeven_fee_tokens: Optional[float]
+    routed_spend_usd: Optional[float]
+    always_tool_spend_usd: Optional[float]
 
 
 def breakeven_tool_fee(records: Sequence[TaskRecord]) -> BreakevenResult:
     """
-    The per-call tool fee at which routing's SPEND equals always-calling.
+    Did routing cost less than always calling the tool, and if not, how
+    much dearer would the tool have to be?
 
-    This is spend, not cost per successful task, and the distinction is
-    the honest part. Cost per success needs correctness under the
-    counterfactual, which is not in the log. Spend needs only token
-    counts and decisions, which are.
+    The arithmetic the project rests on: routing avoids the tool cost of
+    every task it answered directly, and pays the estimator on every task
+    either way. So it wins when
 
-    The arithmetic the project rests on: routing saves the tool cost of
-    every task it answered directly, and pays the estimator's cost on
-    every task either way. So it wins only when
+        direct_calls * tool_cost  >  confidence_cost over ALL tasks
 
-        direct_calls * (tool token cost + fee) > estimator cost on all tasks
-
-    which solves for a fee. Below it, the estimator costs more than the
-    tool calls it prevented -- and for a free tool like a calculator there
-    is no fee to clear, so only an estimator that is itself free can win.
+    Both sides are the same model's tokens, so this is decidable without
+    any price at all -- which is why tokens are the unit here. A free tool
+    (a calculator, a local code runner) costs only its round-trip tokens,
+    so against it only an estimator that is itself nearly free can win.
     That is arithmetic rather than a finding, and it is why the fee a tool
     carries is the variable worth reporting against.
 
-    Returns breakeven_fee_usd = None when no task was answered directly
-    (nothing was saved, so no fee makes routing cheaper).
+    breakeven_fee_tokens is None when nothing was answered directly:
+    routing bought nothing, so no fee makes it cheaper.
     """
-    routed = sum(estimate_record_cost_usd(r) for r in records)
-    confidence = sum(estimate_record_cost_usd(r)
-                     - estimate_record_cost_usd(_without_confidence_stage(r))
-                     for r in records)
-
+    n = len(records)
     tool_records = [r for r in records if r.tool_called]
-    direct = [r for r in records if not r.tool_called]
-    n_direct = len(direct)
+    n_direct = n - len(tool_records)
 
-    # Mean observed tool round-trip, in tokens-as-dollars plus whatever
-    # flat fee was logged, taken from the tasks that actually called it.
-    if tool_records:
-        tool_token_cost = sum(
-            estimate_record_cost_usd(r) - estimate_record_cost_usd(_without_tool_stage(r))
-            for r in tool_records) / len(tool_records)
-        current_fee = sum(r.tool_api_cost_usd for r in tool_records) / len(tool_records)
-    else:
-        tool_token_cost, current_fee = 0.0, 0.0
+    confidence_tokens = sum(_confidence_tokens(r) for r in records)
+    mean_tool_tokens = (sum(_tool_tokens(r) for r in tool_records) / len(tool_records)
+                        if tool_records else 0.0)
 
-    always_tool = routed + n_direct * tool_token_cost
+    saved = n_direct * mean_tool_tokens
+    spent = confidence_tokens
 
-    breakeven = None
+    breakeven_fee = None
     if n_direct:
-        # confidence_spend = n_direct * (tool_token_cost_without_fee + fee)
-        tool_tokens_only = max(tool_token_cost - current_fee, 0.0)
-        breakeven = (confidence / n_direct) - tool_tokens_only
+        # fee needed, in token-equivalents, so that saved >= spent
+        breakeven_fee = max((spent - saved) / n_direct, 0.0)
+
+    routed_usd = total = 0.0
+    priced = True
+    for r in records:
+        c = _cost_usd(r)
+        if c is None:
+            priced = False
+            break
+        routed_usd += c
+    always_usd = None
+    if priced and tool_records:
+        mean_tool_usd = 0.0
+        for r in tool_records:
+            full, no_tool = _cost_usd(r), _cost_usd(_without_tool_stage(r))
+            if full is None or no_tool is None:
+                priced = False
+                break
+            mean_tool_usd += full - no_tool
+        if priced:
+            mean_tool_usd /= len(tool_records)
+            always_usd = routed_usd + n_direct * mean_tool_usd
 
     return BreakevenResult(
-        routed_spend_usd=routed,
-        always_tool_spend_usd=always_tool,
-        tool_calls=len(tool_records),
         direct_calls=n_direct,
-        confidence_spend_usd=confidence,
-        breakeven_fee_usd=breakeven,
-        current_fee_usd=current_fee,
-        pays_off_now=routed < always_tool,
+        tool_calls=len(tool_records),
+        confidence_tokens=confidence_tokens,
+        mean_tool_tokens=mean_tool_tokens,
+        saved_per_direct=mean_tool_tokens,
+        spent_per_task=(spent / n) if n else 0.0,
+        pays_off_now=saved >= spent,
+        breakeven_fee_tokens=breakeven_fee,
+        routed_spend_usd=routed_usd if priced else None,
+        always_tool_spend_usd=always_usd,
     )
 
 

@@ -167,44 +167,69 @@ def test_matrix_reports_no_cpst_column():
 # ---------------------------------------------------------------------------
 
 def test_free_estimator_always_pays_off():
-    # Token entropy costs nothing, so any task answered directly is a
-    # saving and routing can only be cheaper than always calling.
-    records = [rec("a", "gsm8k", 0.9, NOT, tool_prompt=0),
+    # Token entropy spends nothing, so every task answered directly is a
+    # net saving and no fee is needed to justify routing.
+    records = [rec("a", "gsm8k", 0.9, NOT),
                rec("b", "gsm8k", 0.1, REQ, tool_called=True,
                    tool_prompt=100, tool_completion=20)]
     out = breakeven_tool_fee(records)
-    assert out.confidence_spend_usd == 0.0
+    assert out.confidence_tokens == 0
     assert out.pays_off_now is True
-    assert out.always_tool_spend_usd > out.routed_spend_usd
-    # with no estimator cost, routing wins even at a zero fee
-    assert out.breakeven_fee_usd is not None and out.breakeven_fee_usd <= 0.0
+    assert out.breakeven_fee_tokens == 0.0
     print("test_free_estimator_always_pays_off: PASS")
 
 
 def test_expensive_estimator_needs_a_dear_tool():
-    # A heavy estimator on every task against a cheap tool: the break-even
-    # fee is positive, meaning the tool must carry a real charge before
-    # routing is worth it. This is the arithmetic behind the whole project.
+    # A heavy estimator on every task against a cheap tool. 8 direct tasks
+    # each avoided ~120 tool tokens = 960 saved; the estimator spent
+    # 4400 x 10 = 44000. Routing loses, and the fee the tool would need to
+    # carry comes back positive. This is the arithmetic the project rests on.
     records = ([rec(f"d{i}", "gsm8k", 0.9, NOT, conf_prompt=4000,
                     conf_completion=400) for i in range(8)] +
                [rec(f"t{i}", "gsm8k", 0.1, REQ, tool_called=True,
                     tool_prompt=100, tool_completion=20,
                     conf_prompt=4000, conf_completion=400) for i in range(2)])
     out = breakeven_tool_fee(records)
-    assert out.confidence_spend_usd > 0
-    assert out.breakeven_fee_usd is not None and out.breakeven_fee_usd > 0, out
+    assert out.confidence_tokens == 44000, out.confidence_tokens
+    assert out.pays_off_now is False
+    assert out.breakeven_fee_tokens > 0, out
     print("test_expensive_estimator_needs_a_dear_tool: PASS")
 
 
 def test_no_direct_answers_means_nothing_was_saved():
     # Every task escalated, so routing bought nothing and no fee makes it
-    # cheaper -- None rather than a number that implies a trade-off exists.
+    # cheaper -- None rather than a number implying a trade-off exists.
     records = [rec("a", "gsm8k", 0.1, REQ, tool_called=True,
                    tool_prompt=100, tool_completion=20)]
     out = breakeven_tool_fee(records)
     assert out.direct_calls == 0
-    assert out.breakeven_fee_usd is None
+    assert out.breakeven_fee_tokens is None
     print("test_no_direct_answers_means_nothing_was_saved: PASS")
+
+
+def test_an_unpriced_model_still_analyses():
+    # REGRESSION. The first run of the real matrix died here: a locally
+    # served model has no rate, estimate_cost_usd rightly refuses to
+    # invent one, and the analysis raised KeyError instead of reporting
+    # what it could. Tokens need no rate, and the token figures are what
+    # the estimator comparison actually rests on -- so dollars go None
+    # and nothing else is lost.
+    records = [rec("a", "gsm8k", 0.9, NOT, model="llama3.2:3b",
+                   conf_prompt=400, conf_completion=40),
+               rec("b", "gsm8k", 0.1, REQ, model="llama3.2:3b",
+                   tool_called=True, tool_prompt=100, tool_completion=20)]
+    rows = compare_runs({("gsm8k", "entropy"): records})
+    row = rows[0]
+    assert row.confidence_cost_usd is None, "no rate means no dollar figure"
+    assert row.confidence_tokens == 440, row.confidence_tokens
+    assert row.confidence_token_share > 0
+    assert row.cpst_usd is None
+
+    out = breakeven_tool_fee(records)
+    assert out.routed_spend_usd is None
+    assert out.confidence_tokens == 440
+    assert out.breakeven_fee_tokens is not None, "token break-even needs no rate"
+    print("test_an_unpriced_model_still_analyses: PASS")
 
 
 def run_all():
