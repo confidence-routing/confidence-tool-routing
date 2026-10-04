@@ -105,6 +105,7 @@ class RunSummary:
     n: int
     success_rate: float
     cpst_usd: Optional[float]
+    cpst_tokens: Optional[float]
     ece: Optional[float]
     precision: Optional[float]
     recall: Optional[float]
@@ -149,6 +150,7 @@ def summarize_run(dataset: str, method: str, records: Sequence[TaskRecord]) -> R
         dataset=dataset, method=method, n=n,
         success_rate=cpst.success_rate,
         cpst_usd=cpst.cpst_usd,
+        cpst_tokens=cpst.cpst_tokens,
         ece=ece.ece,
         precision=routing.precision, recall=routing.recall, f1=routing.f1,
         unnecessary_call_rate=None, missed_call_rate=None,

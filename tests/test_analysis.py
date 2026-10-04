@@ -224,6 +224,7 @@ def test_an_unpriced_model_still_analyses():
     assert row.confidence_tokens == 440, row.confidence_tokens
     assert row.confidence_token_share > 0
     assert row.cpst_usd is None
+    assert row.cpst_tokens is not None, "token CPST needs no rate"
 
     out = breakeven_tool_fee(records)
     assert out.routed_spend_usd is None
