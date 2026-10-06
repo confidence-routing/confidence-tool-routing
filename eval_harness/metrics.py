@@ -9,6 +9,7 @@ are trivial to unit test and to reuse in notebooks.
 Metrics implemented:
     - compute_cpst                    Cost Per Successful Task
     - compute_ece                     Expected Calibration Error (+ optional grouping)
+    - compute_brier_score             Brier Score (+ optional grouping)
     - compute_routing_precision_recall  Tool-call decision precision/recall/F1
     - compute_unnecessary_call_rate   False-positive tool calls
     - compute_missed_call_rate        False-negative (missed) tool calls
@@ -169,6 +170,77 @@ def compute_ece(
                 [r.confidence_score for r in group_records],
                 [bool(r.correct) for r in group_records],
                 n_bins,
+            )
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Brier Score
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BrierResult:
+    """Brier score for a group of records.
+
+    ``brier`` is the mean squared error between confidence and the 0/1
+    correctness indicator.  Lower is better: 0.0 is perfect calibration
+    with certainty, 1.0 is maximally wrong.
+
+    Unlike ECE, Brier is a *proper* scoring rule -- it cannot be improved
+    by any post-hoc binning or recalibration trick, and it is not
+    sensitive to the number of bins chosen.  Reporting both gives a
+    reviewer two independent views of calibration quality, and heads off
+    the "how many bins?" question that ECE invites.
+    """
+    brier: Optional[float]
+    n: int
+
+
+def _brier_single_group(
+    confidences: List[float], corrects: List[bool],
+) -> BrierResult:
+    n = len(confidences)
+    if n == 0:
+        return BrierResult(brier=None, n=0)
+
+    total = 0.0
+    for conf, correct in zip(confidences, corrects):
+        conf = min(max(conf, 0.0), 1.0)
+        total += (conf - float(bool(correct))) ** 2
+
+    return BrierResult(brier=total / n, n=n)
+
+
+def compute_brier_score(
+    records: Sequence[TaskRecord],
+    group_by: Optional[Callable[[TaskRecord], str]] = None,
+) -> Dict[str, BrierResult]:
+    """
+    Brier score over records that have a confidence_score and a correct
+    label.  Same filtering and grouping convention as compute_ece so the
+    two are always computed over the same population.
+
+    Returns: {"aggregate": BrierResult, group_key: BrierResult, ...}
+    """
+    eligible = [r for r in records if r.confidence_score is not None and r.correct is not None]
+
+    result: Dict[str, BrierResult] = {
+        "aggregate": _brier_single_group(
+            [r.confidence_score for r in eligible],
+            [bool(r.correct) for r in eligible],
+        )
+    }
+
+    if group_by is not None:
+        groups: Dict[str, List[TaskRecord]] = {}
+        for r in eligible:
+            key = group_by(r)
+            groups.setdefault(key, []).append(r)
+        for key, group_records in groups.items():
+            result[key] = _brier_single_group(
+                [r.confidence_score for r in group_records],
+                [bool(r.correct) for r in group_records],
             )
 
     return result

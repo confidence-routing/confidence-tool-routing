@@ -22,7 +22,7 @@ from eval_harness.models import (
 from eval_harness.metrics import (
     compute_cpst, compute_ece, compute_routing_precision_recall,
     compute_unnecessary_call_rate, compute_missed_call_rate,
-    compute_latency_breakdown,
+    compute_latency_breakdown, compute_brier_score,
 )
 from eval_harness.costs import estimate_cost_usd
 
@@ -222,6 +222,92 @@ def test_latency_breakdown_direct_vs_tool():
     assert abs(result.tool_only.mean_ms - 1110) < 1e-6  # 100+10+1000
     assert result.overall.n == 3
     print("test_latency_breakdown_direct_vs_tool: PASS")
+
+
+# ---------------------------------------------------------------------------
+# Brier Score
+# ---------------------------------------------------------------------------
+
+def test_brier_perfect_confidence_and_correct():
+    # confidence=1.0, correct=True -> (1.0 - 1)^2 = 0.0
+    # confidence=0.0, correct=False -> (0.0 - 0)^2 = 0.0
+    # mean = 0.0  (perfect calibration with certainty)
+    records = [
+        make_record(task_id="a", confidence_score=1.0, correct=True),
+        make_record(task_id="b", confidence_score=0.0, correct=False),
+    ]
+    result = compute_brier_score(records)
+    agg = result["aggregate"]
+    assert agg.n == 2
+    assert abs(agg.brier - 0.0) < 1e-12
+    print("test_brier_perfect_confidence_and_correct: PASS")
+
+
+def test_brier_maximally_wrong():
+    # confidence=1.0, correct=False -> (1.0 - 0)^2 = 1.0
+    # confidence=0.0, correct=True  -> (0.0 - 1)^2 = 1.0
+    # mean = 1.0  (worst possible)
+    records = [
+        make_record(task_id="a", confidence_score=1.0, correct=False),
+        make_record(task_id="b", confidence_score=0.0, correct=True),
+    ]
+    result = compute_brier_score(records)
+    assert abs(result["aggregate"].brier - 1.0) < 1e-12
+    print("test_brier_maximally_wrong: PASS")
+
+
+def test_brier_hand_computed_mixed():
+    # confidence=0.8, correct=True  -> (0.8 - 1)^2 = 0.04
+    # confidence=0.6, correct=False -> (0.6 - 0)^2 = 0.36
+    # confidence=0.9, correct=True  -> (0.9 - 1)^2 = 0.01
+    # mean = (0.04 + 0.36 + 0.01) / 3 = 0.41 / 3 = 0.13666...
+    records = [
+        make_record(task_id="a", confidence_score=0.8, correct=True),
+        make_record(task_id="b", confidence_score=0.6, correct=False),
+        make_record(task_id="c", confidence_score=0.9, correct=True),
+    ]
+    result = compute_brier_score(records)
+    expected = (0.04 + 0.36 + 0.01) / 3
+    assert abs(result["aggregate"].brier - expected) < 1e-12
+    print("test_brier_hand_computed_mixed: PASS")
+
+
+def test_brier_skips_records_without_confidence_or_correct():
+    r1 = make_record(task_id="a", confidence_score=None, correct=True)
+    r2 = make_record(task_id="b", confidence_score=0.8, correct=None)
+    r3 = make_record(task_id="c", confidence_score=0.8, correct=True)
+    result = compute_brier_score([r1, r2, r3])
+    assert result["aggregate"].n == 1  # only r3 is eligible
+    print("test_brier_skips_records_without_confidence_or_correct: PASS")
+
+
+def test_brier_empty_returns_none():
+    result = compute_brier_score([])
+    assert result["aggregate"].brier is None
+    assert result["aggregate"].n == 0
+    print("test_brier_empty_returns_none: PASS")
+
+
+def test_brier_grouping():
+    retrieval_records = [
+        make_record(task_id=f"r{i}", confidence_score=1.0, correct=True, tool_used=ToolType.RETRIEVAL)
+        for i in range(5)
+    ]
+    calc_records = [
+        make_record(task_id=f"c{i}", confidence_score=1.0, correct=False, tool_used=ToolType.CALCULATOR)
+        for i in range(5)
+    ]
+    result = compute_brier_score(
+        retrieval_records + calc_records,
+        group_by=lambda r: r.tool_used.value,
+    )
+    # retrieval: all conf=1.0, all correct=True -> (1-1)^2 = 0.0
+    assert abs(result["retrieval"].brier - 0.0) < 1e-12
+    # calculator: all conf=1.0, all correct=False -> (1-0)^2 = 1.0
+    assert abs(result["calculator"].brier - 1.0) < 1e-12
+    # aggregate pools: 5 at 0.0 + 5 at 1.0 -> mean = 0.5
+    assert abs(result["aggregate"].brier - 0.5) < 1e-12
+    print("test_brier_grouping: PASS")
 
 
 def run_all():

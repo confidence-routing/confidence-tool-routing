@@ -22,6 +22,7 @@ from .logger import RunLogger
 from .metrics import (
     compute_cpst,
     compute_ece,
+    compute_brier_score,
     compute_routing_precision_recall,
     compute_unnecessary_call_rate,
     compute_missed_call_rate,
@@ -38,6 +39,7 @@ __all__ = [
     "RunLogger",
     "compute_cpst",
     "compute_ece",
+    "compute_brier_score",
     "compute_routing_precision_recall",
     "compute_unnecessary_call_rate",
     "compute_missed_call_rate",

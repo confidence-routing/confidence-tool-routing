@@ -16,6 +16,7 @@ from .models import TaskRecord
 from .metrics import (
     compute_cpst,
     compute_ece,
+    compute_brier_score,
     compute_routing_precision_recall,
     compute_unnecessary_call_rate,
     compute_missed_call_rate,
@@ -32,6 +33,7 @@ def build_report(
     dump to JSON for a paper table, or feed into a plotting script."""
     cpst = compute_cpst(records)
     ece = compute_ece(records, n_bins=ece_bins, group_by=ece_group_by)
+    brier = compute_brier_score(records, group_by=ece_group_by)
     routing = compute_routing_precision_recall(records)
     unnecessary_rate = compute_unnecessary_call_rate(records)
     missed_rate = compute_missed_call_rate(records)
@@ -41,6 +43,7 @@ def build_report(
         "n_tasks": len(records),
         "cpst": cpst,
         "ece": ece,
+        "brier": brier,
         "routing_precision_recall": routing,
         "unnecessary_call_rate": unnecessary_rate,
         "missed_call_rate": missed_rate,
@@ -82,6 +85,15 @@ def print_report(report: Dict, title: str = "Run Report") -> None:
         if key == "aggregate":
             continue
         print(f"  ECE[{key}]:{' ' * max(1, 12 - len(key))}{'n/a' if res.ece is None else f'{res.ece:.4f}'}  (n={res.n})")
+    print()
+    print("-- Calibration (Brier Score) --")
+    brier = report["brier"]
+    brier_agg = brier["aggregate"]
+    print(f"Aggregate Brier:    {'n/a' if brier_agg.brier is None else f'{brier_agg.brier:.4f}'}  (n={brier_agg.n})")
+    for key, res in brier.items():
+        if key == "aggregate":
+            continue
+        print(f"  Brier[{key}]:{' ' * max(1, 10 - len(key))}{'n/a' if res.brier is None else f'{res.brier:.4f}'}  (n={res.n})")
     print()
     print("-- Routing Decision Quality --")
     print(f"Precision:          {_fmt_pct(routing.precision)}")
