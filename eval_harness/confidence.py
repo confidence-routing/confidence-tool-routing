@@ -795,13 +795,23 @@ def parse_verbalized_confidence(text: Any) -> Optional[float]:
     if percent:
         return min(1.0, max(0.0, float(percent.group(1)) / 100.0))
 
+    # A number in [0, 1] is a probability. Anything above 1 used to be
+    # divided by 100 and returned as a percentage, so "42" came back as
+    # 0.42 -- and this path is only reached when no verdict word was
+    # found, meaning the text was already off-contract. Handing this
+    # function a model ANSWER rather than a verdict therefore produced a
+    # confidence of 0.42 out of nothing: not a missing signal that
+    # compute_ece() would drop, but a plausible number that gets binned
+    # against correctness and reported as calibration.
+    #
+    # A percentage has to say so with a % sign, handled above. "85"
+    # meaning 85% is lost, and that is the right trade: everywhere else
+    # in this module a missing signal beats a fabricated one.
     number = re.search(r"[-+]?(?:\d+\.\d+|\.\d+|\d+)", stripped)
     if number:
         value = float(number.group(0))
         if 0.0 <= value <= 1.0:
             return value
-        if 0.0 <= value <= 100.0:
-            return value / 100.0
 
     return None
 
