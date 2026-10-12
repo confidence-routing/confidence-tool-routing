@@ -11,7 +11,7 @@ report.py is computed by aggregating a list of these.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, fields, asdict
 from enum import Enum
 from typing import Optional, Dict, Any
 import time
@@ -94,6 +94,20 @@ class TaskRecord:
     tool_completion_tokens: int = 0
     tool_api_cost_usd: float = 0.0    # non-token costs, e.g. a paid search API call
 
+    # Tokens spent ESTIMATING confidence, not answering: self-consistency's
+    # k-1 extra samples, the external verifier's call. Without these the
+    # expensive estimators look as cheap as free token entropy, and CPST
+    # cannot show the cost difference the whole project turns on.
+    confidence_prompt_tokens: int = 0
+    confidence_completion_tokens: int = 0
+    # Verifier calls deliberately use a cheaper model than the main answer,
+    # so the confidence stage needs its own rate. Empty = same as model_name.
+    confidence_model_name: str = ""
+    # Escape hatch for a confidence stage spanning two models (hybrid runs
+    # self-consistency on the main model AND a verifier on a cheap one):
+    # price the odd one out here rather than forcing one rate on both.
+    confidence_api_cost_usd: float = 0.0
+
     # --- latency ---
     latency: LatencyBreakdown = field(default_factory=LatencyBreakdown)
 
@@ -102,11 +116,15 @@ class TaskRecord:
 
     @property
     def total_prompt_tokens(self) -> int:
-        return self.prompt_tokens + self.tool_prompt_tokens
+        return self.prompt_tokens + self.tool_prompt_tokens + self.confidence_prompt_tokens
 
     @property
     def total_completion_tokens(self) -> int:
-        return self.completion_tokens + self.tool_completion_tokens
+        return (
+            self.completion_tokens
+            + self.tool_completion_tokens
+            + self.confidence_completion_tokens
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -120,6 +138,29 @@ class TaskRecord:
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "TaskRecord":
         d = dict(d)
+
+        # Forward compatibility OF THIS READER, and only of this reader.
+        # TaskRecord(**d) raises on any key it does not know, so from here
+        # on a field added later will not break this version.
+        #
+        # What it explicitly does NOT do is let an OLDER checkout read a
+        # log written now: that code runs its own from_dict, without this
+        # filter, and still raises on the confidence_* fields this change
+        # adds. A fix cannot reach a reader it does not ship. Anyone
+        # replaying a new log on an old checkout has to update first.
+        #
+        # Unknown keys are set aside rather than dropped: silently
+        # discarding a cost field would let a replay report a different
+        # (cheaper) CPST than the run it came from, with nothing in the
+        # output saying so. Parked in meta, they stay visible to anyone
+        # reading the record.
+        known = {f.name for f in fields(TaskRecord)}
+        unknown = {k: d.pop(k) for k in list(d) if k not in known}
+        if unknown:
+            meta = dict(d.get("meta") or {})
+            meta["_unknown_fields"] = unknown
+            d["meta"] = meta
+
         d["tool_necessity"] = ToolNecessity(d.get("tool_necessity", "not_required"))
         d["routing_decision"] = RoutingDecision(d.get("routing_decision", "direct"))
         d["tool_used"] = ToolType(d.get("tool_used", "none"))
