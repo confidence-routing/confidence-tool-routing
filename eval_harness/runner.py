@@ -28,7 +28,7 @@ from __future__ import annotations
 import time
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .confidence import (
     ConfidenceMethod,
@@ -48,7 +48,7 @@ from .models import (
     ToolNecessity,
     ToolType,
 )
-from .router import route
+from .router import cascade_route, route
 from .tools import calculate, run_python
 
 # Which tool each dataset's TOOL branch reaches for.
@@ -118,6 +118,9 @@ class RunConfig:
     on_missing: str = "tool"
     tool_timeout: float = 10.0
     run_id: str = "run"
+    # (lo, hi) on token entropy. Set, entropy settles every task outside
+    # the band and only the rest pay for ``method``. None = no cascade.
+    cascade_band: Optional[Tuple[float, float]] = None
 
     def uses_self_consistency(self) -> bool:
         return self.method in (ConfidenceMethod.SELF_CONSISTENCY, ConfidenceMethod.HYBRID)
@@ -179,6 +182,17 @@ def estimate_confidence(
     entropy = estimate_entropy_confidence(answer_response)
     signals[ConfidenceMethod.ENTROPY] = entropy
 
+    # Cascade: if entropy already settles it, stop before spending tokens
+    # on the stronger estimator. ``decision`` is set only on this path --
+    # the cut is on entropy's scale, so cfg.threshold does not apply.
+    if cfg.cascade_band is not None and cfg.method != ConfidenceMethod.ENTROPY:
+        settled = cascade_route(getattr(entropy, "confidence", None), cfg.cascade_band)
+        if settled is not None:
+            return {"score": entropy.confidence, "main": main_cost,
+                    "verifier": verifier_cost, "decision": settled,
+                    "stage": "entropy",
+                    "signals": {ConfidenceMethod.ENTROPY.value: entropy.confidence}}
+
     # (b) self-consistency -- k separate calls, main model.
     if cfg.uses_self_consistency():
         samples = client.sample(messages, cfg.model, k=cfg.k,
@@ -206,6 +220,8 @@ def estimate_confidence(
         score = getattr(signals.get(cfg.method), "confidence", None)
 
     return {"score": score, "main": main_cost, "verifier": verifier_cost,
+            "decision": None,
+            "stage": "escalated" if cfg.cascade_band is not None else None,
             "signals": {str(getattr(k, "value", k)): getattr(v, "confidence", None)
                         for k, v in signals.items()}}
 
@@ -315,7 +331,8 @@ def run_task(client: Any, task: Dict[str, Any], cfg: RunConfig) -> TaskRecord:
     conf = estimate_confidence(client, task, answer_response, answer_text, cfg)
     t_conf = time.perf_counter()
 
-    decision = route(conf["score"], cfg.threshold, on_missing=cfg.on_missing)
+    decision = conf["decision"] or route(conf["score"], cfg.threshold,
+                                         on_missing=cfg.on_missing)
 
     final_answer, tool_cost = answer_text, _Cost()
     tool_used, tool_helped = ToolType.NONE, False
@@ -384,6 +401,7 @@ def run_task(client: Any, task: Dict[str, Any], cfg: RunConfig) -> TaskRecord:
         ),
         meta={
             "signals": conf["signals"],
+            "cascade_stage": conf["stage"],
             "tool_helped": tool_helped,
             "verifier_model": cfg.verifier_model if conf["verifier"].prompt else None,
             "verifier_prompt_tokens": conf["verifier"].prompt,

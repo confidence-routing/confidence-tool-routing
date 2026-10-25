@@ -84,7 +84,12 @@ def load_runs(paths: Iterable[str]) -> Dict[RunKey, List[TaskRecord]]:
     grouped: Dict[RunKey, List[TaskRecord]] = {}
     for path in paths:
         for record in RunLogger.iter_load(str(path)):
-            key = (record.dataset, record.confidence_method.value)
+            # A cascade is its own method: merged into the plain run of its
+            # escalation estimator, the comparison it exists for vanishes.
+            method = record.confidence_method.value
+            if (record.meta or {}).get("cascade_stage"):
+                method += "+cascade"
+            key = (record.dataset, method)
             grouped.setdefault(key, []).append(record)
     return grouped
 

@@ -236,6 +236,23 @@ def test_select_threshold_rejects_bad_objective():
     raise AssertionError("expected ValueError for unknown objective")
 
 
+def test_cascade_route_bands():
+    from eval_harness.router import cascade_route
+    band = (0.3, 0.8)
+    assert cascade_route(0.1, band) == RoutingDecision.TOOL
+    assert cascade_route(0.8, band) == RoutingDecision.DIRECT   # hi is inclusive
+    assert cascade_route(0.3, band) is None                     # lo escalates
+    assert cascade_route(None, band) is None
+    assert cascade_route(float("nan"), band) is None
+    try:
+        cascade_route(0.5, (0.8, 0.3))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for lo > hi")
+    print("test_cascade_route_bands: PASS")
+
+
 def run_all():
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     for t in tests:

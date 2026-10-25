@@ -61,6 +61,11 @@ def main(argv=None) -> int:
     p.add_argument("--method", default="entropy", choices=sorted(METHODS),
                    help="which confidence estimator to use")
     p.add_argument("--threshold", type=float, default=0.7)
+    p.add_argument("--cascade", type=float, nargs=2, metavar=("LO", "HI"),
+                   default=None,
+                   help="entropy-first cascade: settle on entropy below LO "
+                        "(tool) or at/above HI (direct); only tasks in between "
+                        "run --method")
     p.add_argument("--k", type=int, default=5, help="self-consistency samples")
     p.add_argument("--provider", default=DEFAULT_PROVIDER)
     p.add_argument("--model", default="gpt-oss-120b")
@@ -183,8 +188,9 @@ def main(argv=None) -> int:
         threshold=args.threshold,
         k=args.k,
         seed=args.seed,
+        cascade_band=tuple(args.cascade) if args.cascade else None,
         run_id=args.run_id or
-        f"{args.dataset}_{args.method}_{datetime.datetime.now():%Y%m%d_%H%M%S_%f}",
+        f"{args.dataset}_{args.method}{'_cascade' if args.cascade else ''}_{datetime.datetime.now():%Y%m%d_%H%M%S_%f}",
     )
 
     print(f"{args.dataset}: {len(tasks)} tasks | {cfg.model} | "

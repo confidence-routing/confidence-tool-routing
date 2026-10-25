@@ -58,7 +58,7 @@ takes running the pipeline at each threshold, not re-reading one run.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Callable, List, Optional, Sequence, Union
+from typing import Callable, List, Optional, Sequence, Tuple, Union
 
 from .models import TaskRecord, RoutingDecision, ToolType
 from .metrics import (
@@ -93,6 +93,37 @@ def route(
         return RoutingDecision.TOOL if on_missing == "tool" else RoutingDecision.DIRECT
 
     return RoutingDecision.TOOL if confidence < threshold else RoutingDecision.DIRECT
+
+
+def cascade_route(
+    entropy: Optional[float],
+    band: Tuple[float, float],
+) -> Optional[RoutingDecision]:
+    """
+    The cheap first stage of a cascade: settle the task on token entropy
+    if it is clearly outside ``band = (lo, hi)``, else return None and let
+    the caller pay for a stronger estimator.
+
+    TOOL iff ``entropy < lo``, DIRECT iff ``entropy >= hi`` -- the same
+    strict-below convention as ``route``. Missing or NaN escalates rather
+    than guessing: the stronger estimator is exactly what a missing
+    signal should buy.
+
+    The band is on entropy's own scale, not the escalation estimator's
+    threshold. The two estimators are calibrated differently (the 3-seed
+    analysis tunes entropy and hybrid to different cuts), so one number
+    cannot serve as both.
+    """
+    lo, hi = band
+    if not 0.0 <= lo <= hi <= 1.0:
+        raise ValueError(f"cascade band must satisfy 0 <= lo <= hi <= 1, got {band!r}")
+    if entropy is None or entropy != entropy:
+        return None
+    if entropy < lo:
+        return RoutingDecision.TOOL
+    if entropy >= hi:
+        return RoutingDecision.DIRECT
+    return None
 
 
 def route_record(

@@ -457,6 +457,46 @@ def test_keyed_providers_still_require_a_key():
     print("test_keyed_providers_still_require_a_key: PASS")
 
 
+# ---------------------------------------------------------------------------
+# Cascade -- entropy settles the clear cases, the rest pay for the method
+# ---------------------------------------------------------------------------
+
+# 0.7 / 0.3 -> normalized entropy ~0.88 -> confidence ~0.12, inside (0.05, 0.9)
+MIDDLING = [{"token": "5", "logprob": math.log(0.7)},
+            {"token": "6", "logprob": math.log(0.3)}]
+CASCADE = RunConfig(method=ConfidenceMethod.SELF_CONSISTENCY, k=5,
+                    cascade_band=(0.05, 0.9))
+
+
+def test_cascade_settles_clear_cases_on_entropy_alone():
+    for top, decision in ((CONFIDENT, RoutingDecision.DIRECT),
+                          (UNSURE, RoutingDecision.TOOL)):
+        client = StubClient(top=top)
+        rec = run_task(client, GSM, CASCADE)
+        assert rec.routing_decision == decision
+        assert rec.meta["cascade_stage"] == "entropy"
+        assert rec.confidence_prompt_tokens == 0, "settled task paid for sampling"
+        assert not any("sample_k" in c for c in client.calls)
+    print("test_cascade_settles_clear_cases_on_entropy_alone: PASS")
+
+
+def test_cascade_escalates_inside_the_band():
+    client = StubClient(top=MIDDLING)
+    rec = run_task(client, GSM, CASCADE)
+    assert 0.05 <= rec.meta["signals"]["entropy"] < 0.9
+    assert rec.meta["cascade_stage"] == "escalated"
+    assert rec.confidence_prompt_tokens == 500      # the k samples ran
+    # stub samples all agree -> self-consistency 1.0 -> direct at 0.7
+    assert rec.routing_decision == RoutingDecision.DIRECT
+    print("test_cascade_escalates_inside_the_band: PASS")
+
+
+def test_no_cascade_leaves_the_stage_unset():
+    rec = run_task(StubClient(top=CONFIDENT), GSM, RunConfig())
+    assert rec.meta["cascade_stage"] is None
+    print("test_no_cascade_leaves_the_stage_unset: PASS")
+
+
 def run_all():
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     for t in tests:
