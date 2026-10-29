@@ -5,22 +5,23 @@ grading.py
 Fills in ``TaskRecord.correct``. One grader per dataset, chosen because
 both grade themselves without a human or a judge model in the loop:
 
-    gsm8k      final number matches the gold number
-    humaneval  the code passes the test suite the dataset ships with
-    coqa       token-overlap F1 against the reference answer
+    gsm8k        final number matches the gold number
+    humaneval    the code passes the test suite the dataset ships with
+    coqa         token-overlap F1 against the reference answer
+    overruling   binary Yes/No verdict
+    headlines    category label match
 
 Automatic grading is why these two datasets were picked for the shipping
 scope. A grader that needs an LLM to judge correctness would put a second
 unvalidated model inside the metric the whole experiment reports, which
 is a problem you cannot argue your way out of in a results table.
 
-CoQA is the one exception to reusing confidence.py's normalization, and
-the exception is deliberate. Its published numbers are SQuAD-style token
-F1, which normalizes by stripping articles and punctuation before
-comparing bags of tokens -- a convention, not a better idea. Deviating
-from it would make the results incomparable to every other CoQA number
-in the literature, which is a worse outcome than having two normalizers.
-The other datasets have no such convention, so they still share one.
+CoQA is the one place confidence.py's normalization is deliberately NOT
+reused. Its published numbers are SQuAD-style token F1, which strips
+articles and punctuation before comparing token bags -- a convention, not
+a better idea. Deviating from it would make the results incomparable to
+every other CoQA number in the literature, which is worse than having two
+normalizers. The yes/no and category graders below do reuse what exists.
 
 Answer normalization is otherwise NOT reimplemented here. ``confidence.py`` already
 canonicalizes free-text answers for vote bucketing -- case, whitespace,
@@ -37,7 +38,7 @@ import re
 from collections import Counter
 from typing import Any, Dict, List, Optional
 
-from .confidence import normalize_answer
+from .confidence import _verdict_key, normalize_answer
 from .tools import run_python
 
 # A number, possibly signed, comma-grouped, decimal, or currency-prefixed.
@@ -141,14 +142,13 @@ _ARTICLES = {"a", "an", "the"}
 
 def _normalize_qa(text: Any) -> List[str]:
     """
-    SQuAD/CoQA normalization, in that order: casefold, DELETE punctuation,
-    drop articles, split on whitespace.
+    SQuAD/CoQA normalization, in order: casefold, DELETE punctuation, drop
+    articles, split on whitespace.
 
     Deleting punctuation rather than replacing it with a space is the
     detail that matters, and it is the published convention:
-    "down-stream" has to normalize to one token, "downstream", or it
-    scores 0 against it. Spacing the hyphen instead gives two tokens and
-    no overlap at all -- the model is marked wrong for hyphenating.
+    "down-stream" has to become one token, "downstream", or it scores 0
+    against it -- the model marked wrong purely for hyphenating.
     """
     if text is None:
         return []
@@ -163,18 +163,16 @@ def token_f1(prediction: Any, reference: Any) -> float:
     Token-overlap F1 in [0, 1], the standard CoQA metric.
 
     Free-text answers do not admit exact match: "down-stream", "he went
-    down-stream" and "downstream" are the same answer, and grading them
-    as three would understate every model equally but make the numbers
-    meaningless. F1 over token bags is the convention that handles it.
+    down-stream" and "downstream" are one answer, and grading them as
+    three understates every model equally and means nothing.
 
-    Yes/no answers are the known weak spot -- a single token means F1 is
-    all-or-nothing there -- which is a property of the metric, not of
-    this implementation, and it is what published CoQA numbers use.
+    Yes/no answers are the known weak spot -- one token makes F1
+    all-or-nothing there -- which is a property of the metric rather than
+    this implementation, and what published CoQA numbers use.
     """
     pred, ref = _normalize_qa(prediction), _normalize_qa(reference)
     if not pred or not ref:
-        # Both empty is a match; one empty is not.
-        return float(pred == ref)
+        return float(pred == ref)     # both empty is a match; one empty is not
 
     common = Counter(pred) & Counter(ref)
     overlap = sum(common.values())
@@ -187,16 +185,89 @@ def token_f1(prediction: Any, reference: Any) -> float:
 
 
 # TaskRecord.correct is a bool, so the continuous F1 has to be cut
-# somewhere. 0.5 is the conventional "substantially right" line. The raw
-# score is kept in the record's meta by the runner, so a different cut
-# can be applied afterwards without re-running anything.
+# somewhere. 0.5 is the conventional "substantially right" line, and the
+# runner keeps the raw score in meta so a different cut can be applied
+# afterwards without paying for the run again.
 COQA_F1_THRESHOLD = 0.5
 
 
 def grade_coqa(model_answer: Any, gold_answer: Any,
                threshold: float = COQA_F1_THRESHOLD) -> bool:
-    """True if the answer's token-overlap F1 clears ``threshold``."""
+    """True if token-overlap F1 clears ``threshold``."""
     return token_f1(model_answer, gold_answer) >= threshold
+
+
+# ---------------------------------------------------------------------------
+# Overruling -- binary Yes/No
+# ---------------------------------------------------------------------------
+
+def extract_verdict(text: Any) -> Optional[str]:
+    """
+    "yes" or "no" from a reply, or None if it committed to neither.
+
+    Scans word by word and takes the FIRST verdict token, because a model
+    asked a yes/no question answers it and then justifies: "Yes. The
+    sentence explicitly rejects the earlier holding" also contains
+    "rejects". Taking the last match would grade the justification.
+
+    None rather than a default: a reply that never says yes or no is a
+    non-answer, and scoring it as "no" would credit the model for every
+    negative case it dodged. The yes/no vocabulary is confidence.py's,
+    not a second list.
+    """
+    if text is None:
+        return None
+    if not isinstance(text, str):
+        text = str(text)
+    for raw in text.split():
+        verdict = _verdict_key(raw)
+        if verdict is not None:
+            return verdict
+    return None
+
+
+def grade_binary(model_answer: Any, gold_answer: Any) -> bool:
+    """True if the reply's verdict matches the gold Yes/No label."""
+    predicted = extract_verdict(model_answer)
+    gold = extract_verdict(gold_answer)
+    if predicted is None or gold is None:
+        return False
+    return predicted == gold
+
+
+# ---------------------------------------------------------------------------
+# Headlines -- category label
+# ---------------------------------------------------------------------------
+
+def _normalize_category(text: Any) -> str:
+    """Casefold, delete punctuation, collapse whitespace. "U.S. NEWS" and
+    "us news" are the same label; punctuation is formatting."""
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        text = str(text)
+    return " ".join("".join(
+        ch for ch in text.lower() if ch.isalnum() or ch.isspace()).split())
+
+
+def grade_category(model_answer: Any, gold_answer: Any) -> bool:
+    """
+    True if the reply names the gold category.
+
+    Accepts the label alone or wrapped in a sentence ("The category is
+    U.S. NEWS"), since a classifier prompt does not reliably suppress
+    prose. Matching is on the whole normalized label as a phrase, not on
+    individual words: several categories share a word -- U.S. NEWS, WORLD
+    NEWS, WEIRD NEWS -- and word-level matching would count any of them
+    as any other.
+    """
+    gold = _normalize_category(gold_answer)
+    if not gold:
+        return False
+    predicted = _normalize_category(model_answer)
+    if not predicted:
+        return False
+    return predicted == gold or f" {gold} " in f" {predicted} "
 
 
 def grade(dataset: str, model_answer: Any, gold_answer: Any = None,
@@ -209,4 +280,8 @@ def grade(dataset: str, model_answer: Any, gold_answer: Any = None,
         return grade_humaneval(model_answer, meta or {})
     if dataset == "coqa":
         return grade_coqa(model_answer, gold_answer)
+    if dataset == "overruling":
+        return grade_binary(model_answer, gold_answer)
+    if dataset == "headlines":
+        return grade_category(model_answer, gold_answer)
     raise KeyError(f"No grader for dataset '{dataset}'. Add one in grading.py.")

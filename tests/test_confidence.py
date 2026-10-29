@@ -710,6 +710,27 @@ def test_leading_verdict_beats_trailing_number():
     print("test_leading_verdict_beats_trailing_number: PASS")
 
 
+def test_a_bare_integer_is_not_a_confidence():
+    # REGRESSION. This used to read any number <= 100 as a percentage, so
+    # "42" returned 0.42. This branch is only reached when no verdict word
+    # was found, meaning the text is already off-contract -- so passing a
+    # model ANSWER here produced a confidence of 0.42 out of nothing.
+    #
+    # That is the worst failure mode available: not a None that
+    # compute_ece() drops, but a plausible number that gets binned against
+    # correctness. A percentage has to say so with a % sign now.
+    assert parse_verbalized_confidence("42") is None
+    assert parse_verbalized_confidence("85") is None
+    # Still handled: an explicit percentage, and any number already in
+    # [0, 1], where it is unambiguously a probability -- including the
+    # integer endpoints, which a verifier may legitimately emit.
+    assert abs(parse_verbalized_confidence("85%") - 0.85) < 1e-9
+    assert abs(parse_verbalized_confidence("0.85") - 0.85) < 1e-9
+    assert parse_verbalized_confidence("0") == 0.0
+    assert parse_verbalized_confidence("1") == 1.0
+    print("test_a_bare_integer_is_not_a_confidence: PASS")
+
+
 def test_verbalized_unparseable_returns_none():
     assert parse_verbalized_confidence("I cannot determine this") is None
     assert parse_verbalized_confidence("") is None
